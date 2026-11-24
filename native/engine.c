@@ -1,14 +1,26 @@
 // Freestanding zero-libc SIMD static site generator engine (100% byte-exact to makefun-site 1.0.0).
 #include "template.h"
 
-// ---------------- Reusable .bss Arenas (zero-filled lazily by OS, only touched pages fault!) ----------------
+// ---------------- Reusable .bss Arenas (shared across Dual-TU AVX2+SSE2!) ----------------
 #define ARENA_CAP (32u * 1024u * 1024u)
+#define IN_BSS_CAP (16u * 1024u * 1024u)
+#ifdef DUAL_TU_WORKER
+extern char g_arena_mem[ARENA_CAP];
+extern char g_in_bss[IN_BSS_CAP];
+extern char g_id_arena_mem[65536];
+extern char g_md_buf_init[131072];
+extern char g_join_buf_init[65536];
+extern HeadingIdSet g_hset;
+extern TocItem g_toc_scratch[1024];
+#else
 static char g_arena_mem[ARENA_CAP];
+static char g_in_bss[IN_BSS_CAP];
 static char g_id_arena_mem[65536];
 static char g_md_buf_init[131072];
 static char g_join_buf_init[65536];
 static HeadingIdSet g_hset;
 static TocItem g_toc_scratch[1024];
+#endif
 
 // ---------------- Generic Open-Addressed String->u32 Hash Map ----------------
 typedef struct {
@@ -164,6 +176,7 @@ static void sort_strs(Str *arr, int lo, int hi) {
 // ---------------- SIMD JSON Parser ----------------
 static inline void skip_ws(const char **pp, const char *end) {
     const char *p = *pp;
+    if (__builtin_expect(p < end && (uint8_t)*p > ' ', 1)) return;
     while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) p++;
     *pp = p;
 }
@@ -179,31 +192,32 @@ static inline uint32_t parse_u4(const char *p) {
     return (hex_val(p[0]) << 12) | (hex_val(p[1]) << 8) | (hex_val(p[2]) << 4) | hex_val(p[3]);
 }
 
-#if defined(__x86_64__)
-__attribute__((target("avx2")))
+#if defined(__AVX2__)
 static Str parse_json_str_avx2(const char **pp, const char *end, Arena *a, int norm_cr, int *out_has_cr) {
     const char *p = *pp + 1; // skip opening '"'
     const char *start = p;
     const __m256i v_qt = _mm256_set1_epi8('"');
     const __m256i v_bs = _mm256_set1_epi8('\\');
-    // Fast scan for unescaped string (zero-copy!)
-    while (p + 32 <= end) {
-        __m256i v = _mm256_loadu_si256((const __m256i *)p);
-        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v, v_qt), _mm256_cmpeq_epi8(v, v_bs)));
-        if (m) {
-            p += __builtin_ctz(m);
-            if (*p == '"') {
-                *pp = p + 1;
-                return (Str){ start, (uint32_t)(p - start) };
+    if (!norm_cr) {
+        // Fast zero-copy scan for unescaped strings (paths, keys, titles)
+        while (p + 32 <= end) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)p);
+            uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v, v_qt), _mm256_cmpeq_epi8(v, v_bs)));
+            if (m) {
+                p += __builtin_ctz(m);
+                if (*p == '"') {
+                    *pp = p + 1;
+                    return (Str){ start, (uint32_t)(p - start) };
+                }
+                goto has_escape;
             }
-            goto has_escape;
+            p += 32;
         }
-        p += 32;
-    }
-    while (p < end && *p != '"' && *p != '\\') p++;
-    if (p < end && *p == '"') {
-        *pp = p + 1;
-        return (Str){ start, (uint32_t)(p - start) };
+        while (p < end && *p != '"' && *p != '\\') p++;
+        if (p < end && *p == '"') {
+            *pp = p + 1;
+            return (Str){ start, (uint32_t)(p - start) };
+        }
     }
 
 has_escape:;
@@ -218,7 +232,7 @@ has_escape:;
             __m256i v = _mm256_loadu_si256((const __m256i *)p);
             _mm256_storeu_si256((__m256i *)dst, v);
             uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v, v_qt), _mm256_cmpeq_epi8(v, v_bs)));
-            if (m == 0) { dst += 32; p += 32; continue; }
+            if (__builtin_expect(m == 0, 1)) { dst += 32; p += 32; continue; }
             uint32_t tz = (uint32_t)__builtin_ctz(m);
             dst += tz;
             p += tz;
@@ -228,8 +242,8 @@ has_escape:;
         if (c != '\\') { *dst++ = c; continue; }
         if (p >= end) break;
         char e = *p++;
+        if (__builtin_expect(e == 'n', 1)) { *dst++ = '\n'; continue; }
         switch (e) {
-            case 'n':  *dst++ = '\n'; break;
             case '"':  *dst++ = '"';  break;
             case '\\': *dst++ = '\\'; break;
             case '/':  *dst++ = '/';  break;
@@ -351,10 +365,11 @@ static Str parse_json_str_scalar(const char **pp, const char *end, Arena *a, int
 }
 
 static inline Str parse_json_str(const char **pp, const char *end, Arena *a, int norm_cr, int *out_has_cr) {
-#if defined(__x86_64__)
-    if (g_has_avx2) return parse_json_str_avx2(pp, end, a, norm_cr, out_has_cr);
-#endif
+#if defined(__AVX2__)
+    return parse_json_str_avx2(pp, end, a, norm_cr, out_has_cr);
+#else
     return parse_json_str_scalar(pp, end, a, norm_cr, out_has_cr);
+#endif
 }
 
 static uint32_t parse_json_uint(const char **pp, const char *end) {
@@ -759,6 +774,8 @@ typedef struct {
     Str base;
     Str cur_path;
     Str cur_dir;
+    Str dir_parts[32];
+    uint32_t dir_nparts;
     const PostData *sources;
     const StrMap *by_source;
     const StrMap *static_paths;
@@ -768,6 +785,51 @@ typedef struct {
     Arena *arena;
     char tmp_href[2048];
 } LinkCtx;
+
+static inline void link_ctx_set_source(LinkCtx *ctx, Str path) {
+    ctx->cur_path = path;
+    Str dir = dir_of(path);
+    ctx->cur_dir = dir;
+    uint32_t np = 0;
+    if (dir.n > 0) {
+        uint32_t s = 0;
+        for (uint32_t i = 0; i <= dir.n; i++) {
+            if (i == dir.n || dir.p[i] == '/') {
+                if (np < 32) ctx->dir_parts[np++] = (Str){ dir.p + s, i - s };
+                s = i + 1;
+            }
+        }
+    }
+    ctx->dir_nparts = np;
+}
+
+static inline int resolve_rel_path_pre(const Str *dir_parts, uint32_t dir_nparts, Str rel, char *out, uint32_t *out_len) {
+    Str parts[64];
+    uint32_t nparts = dir_nparts;
+    for (uint32_t i = 0; i < dir_nparts; i++) parts[i] = dir_parts[i];
+    uint32_t s = 0;
+    for (uint32_t i = 0; i <= rel.n; i++) {
+        if (i == rel.n || rel.p[i] == '/') {
+            Str seg = { rel.p + s, i - s };
+            s = i + 1;
+            if (seg.n == 0 || (seg.n == 1 && seg.p[0] == '.')) continue;
+            if (seg.n == 2 && seg.p[0] == '.' && seg.p[1] == '.') {
+                if (nparts == 0) return 0;
+                nparts--;
+            } else {
+                if (nparts < 64) parts[nparts++] = seg;
+            }
+        }
+    }
+    uint32_t pos = 0;
+    for (uint32_t i = 0; i < nparts; i++) {
+        if (i > 0) out[pos++] = '/';
+        fast_memcpy(out + pos, parts[i].p, parts[i].n);
+        pos += parts[i].n;
+    }
+    *out_len = pos;
+    return 1;
+}
 
 static Str resolve_link_cb(void *vctx, Str target) {
     LinkCtx *ctx = (LinkCtx *)vctx;
@@ -781,7 +843,7 @@ static Str resolve_link_cb(void *vctx, Str target) {
     if (rel.n > 0) {
         char rbuf[1024];
         uint32_t rlen = 0;
-        if (resolve_rel_path(ctx->cur_dir, rel, rbuf, &rlen)) {
+        if (resolve_rel_path_pre(ctx->dir_parts, ctx->dir_nparts, rel, rbuf, &rlen)) {
             Str rstr = { rbuf, rlen };
             uint32_t h = fnv1a_hash(rbuf, rlen);
             uint32_t sidx;
@@ -1039,9 +1101,11 @@ static void process_case(const char **pp, const char *end) {
         __builtin_memset(s, 0, sizeof(*s));
         s->path = f->path;
         s->title = fm.title;
+        s->title_hj = html_json_escape_arena(fm.title, &arena);
         s->date = fm.has_date ? fm.date : (Str){ "", 0 };
         s->date_long = fm.has_date ? make_long_date(fm.date, &arena) : (Str){ "", 0 };
         s->summary = fm.has_summary ? fm.summary : (Str){ "", 0 };
+        s->summary_hj = fm.has_summary ? html_json_escape_arena(fm.summary, &arena) : (Str){ "", 0 };
         s->slug = fm.has_slug ? fm.slug : (Str){ "", 0 }; // empty means compute via slugify(title)
         s->body = fm.body;
         s->layout = layout;
@@ -1117,6 +1181,7 @@ static void process_case(const char **pp, const char *end) {
         ub[up++] = '/';
         s->out_dir = (Str){ ub + od_off, out_dir_len };
         s->url = (Str){ ub, url_len };
+        s->url_hj = html_json_escape_arena(s->url, &arena);
         sm_put_new(&by_source, s->path, fnv1a_hash(s->path.p, s->path.n), i);
     }
 
@@ -1186,6 +1251,7 @@ static void process_case(const char **pp, const char *end) {
                 tidx = tags_len++;
                 TagData *td = &tags_arr[tidx];
                 td->name = rtags[j];
+                td->name_hj = html_json_escape_arena(rtags[j], &arena);
                 td->slug = tslug;
                 uint32_t ulen = base.n + 6 + tslug.n + 1;
                 char *up = arena_alloc(&arena, ulen);
@@ -1194,6 +1260,7 @@ static void process_case(const char **pp, const char *end) {
                 fast_memcpy(up + base.n + 6, tslug.p, tslug.n);
                 up[ulen - 1] = '/';
                 td->url = (Str){ up, ulen };
+                td->url_hj = html_json_escape_arena(td->url, &arena);
                 td->post_cap = 16;
                 td->post_idxs = (uint32_t *)arena_alloc_aligned(&arena, 16u * 4u, 4);
                 td->post_count = 0;
@@ -1208,7 +1275,7 @@ static void process_case(const char **pp, const char *end) {
                 td->post_cap = ncap;
             }
             td->post_idxs[td->post_count++] = k;
-            refs[ref_n++] = (TagRef){ td->name, td->slug, td->url };
+            refs[ref_n++] = (TagRef){ td->name, td->name_hj, td->slug, td->url, td->url_hj };
         }
         p->tag_refs = refs;
         p->tag_count = ref_n;
@@ -1234,9 +1301,9 @@ static void process_case(const char **pp, const char *end) {
             uint32_t sh = fnv1a_hash(tslug.p, tslug.n);
             uint32_t tidx;
             if (sm_get(&tag_by_slug, tslug, sh, &tidx)) {
-                refs[ref_n++] = (TagRef){ tags_arr[tidx].name, tags_arr[tidx].slug, tags_arr[tidx].url };
+                refs[ref_n++] = (TagRef){ tags_arr[tidx].name, tags_arr[tidx].name_hj, tags_arr[tidx].slug, tags_arr[tidx].url, tags_arr[tidx].url_hj };
             } else {
-                refs[ref_n++] = (TagRef){ rtags[j], tslug, (Str){"", 0} };
+                refs[ref_n++] = (TagRef){ rtags[j], html_json_escape_arena(rtags[j], &arena), tslug, (Str){"", 0}, (Str){"", 0} };
             }
         }
         s->tag_refs = refs;
@@ -1272,8 +1339,7 @@ static void process_case(const char **pp, const char *end) {
         uint32_t w = words_of(p->body.p, p->body.n);
         p->reading_minutes = (w == 0) ? 1u : (w + 199u) / 200u;
         p->words_computed = 1;
-        lctx.cur_path = p->path;
-        lctx.cur_dir = dir_of(p->path);
+        link_ctx_set_source(&lctx, p->path);
         id_arena.pos = 0;
         MdResult md = render_markdown_json(p->body, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, 1024);
         // Save html + toc + excerpt into arena so we don't re-render these 3-6 posts later!
@@ -1338,7 +1404,13 @@ static void process_case(const char **pp, const char *end) {
     // A. Stream all pages/posts with LAZY per-page Markdown rendering!
     for (uint32_t i = 0; i < src_count; i++) {
         PostData *s = &sources[i];
-        if (!s->words_computed) {
+        // Lookup and lazily compile layout for kind=1 (page/post) FIRST so we know uses_readmin!
+        uint32_t tidx = 0;
+        sm_get(&tpl_map, s->layout, fnv1a_hash(s->layout.p, s->layout.n), &tidx);
+        Template *lt = &templates[tidx];
+        if (!lt->baked_ready[1]) compile_layout(&rc, lt, 1, &arena);
+
+        if (!s->words_computed && (s->is_post || lt->uses_readmin[1])) {
             uint32_t w = words_of(s->body.p, s->body.n);
             s->reading_minutes = (w == 0) ? 1u : (w + 199u) / 200u;
             s->words_computed = 1;
@@ -1346,8 +1418,7 @@ static void process_case(const char **pp, const char *end) {
         MdResult md;
         const MdResult *md_ptr = NULL;
         if (!s->md_prerendered) {
-            lctx.cur_path = s->path;
-            lctx.cur_dir = dir_of(s->path);
+            link_ctx_set_source(&lctx, s->path);
             id_arena.pos = 0;
             md = render_markdown_json(s->body, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, 1024);
             md_ptr = &md;
@@ -1361,11 +1432,6 @@ static void process_case(const char **pp, const char *end) {
                 s->has_excerpt_cached = 1;
             }
         }
-        // Lookup and lazily compile layout for kind=1 (page/post)
-        uint32_t tidx = 0;
-        sm_get(&tpl_map, s->layout, fnv1a_hash(s->layout.p, s->layout.n), &tidx);
-        Template *lt = &templates[tidx];
-        if (!lt->baked_ready[1]) compile_layout(&rc, lt, 1, &arena);
 
         // Register output path "<out_dir>/index.html"
         uint32_t plen = s->out_dir.n + 11u;
@@ -1538,8 +1604,19 @@ static void build_path(char *dst, const char *dir, uint32_t dlen, const char *su
     dst[pos + slen] = '\0';
 }
 
-static void run_cli(void) {
+#ifndef ENGINE_FN_NAME
+#define ENGINE_FN_NAME run_cli
+#endif
+
+#ifdef DUAL_TU_WORKER
+__attribute__((visibility("hidden")))
+#else
+static
+#endif
+void ENGINE_FN_NAME(void) {
+#ifndef DUAL_TU_WORKER
     detect_cpu_features();
+#endif
 
     char in_path[512];
     char out_path[512];
@@ -1579,8 +1656,23 @@ static void run_cli(void) {
     LinuxStat st;
     if (sys_fstat(in_fd, &st) < 0 || st.st_size <= 0) sys_exit_group(1);
     size_t fsize = (size_t)st.st_size;
-    const char *data = (const char *)sys_mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, in_fd, 0);
-    if ((long)data < 0) sys_exit_group(1);
+    const char *data = NULL;
+#ifdef USE_READ_IO
+    if (fsize < IN_BSS_CAP - 64) {
+        size_t off = 0;
+        while (off < fsize) {
+            long r = sys_read(in_fd, g_in_bss + off, fsize - off);
+            if (r == -4) continue;
+            if (r <= 0) break;
+            off += (size_t)r;
+        }
+        data = g_in_bss;
+    } else
+#endif
+    {
+        data = (const char *)sys_mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, in_fd, 0);
+        if ((long)data < 0) sys_exit_group(1);
+    }
 
     int out_fd = (int)sys_openat(AT_FDCWD, out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) sys_exit_group(1);
@@ -1610,15 +1702,17 @@ static void run_cli(void) {
     sys_close(in_fd);
 }
 
+#ifndef DUAL_TU_WORKER
 #ifdef STANDALONE_CLI
 int main(void) {
-    run_cli();
+    ENGINE_FN_NAME();
     return 0;
 }
 #else
-__attribute__((constructor, visibility("hidden")))
+__attribute__((constructor))
 static void site_gen_init(void) {
-    run_cli();
+    ENGINE_FN_NAME();
     sys_exit_group(0);
 }
+#endif
 #endif

@@ -259,7 +259,7 @@ static inline void fast_memcpy(void *restrict dst, const void *restrict src, siz
 #endif
 }
 
-#ifndef STANDALONE_CLI
+#if !defined(STANDALONE_CLI) && !defined(DUAL_TU_WORKER)
 __attribute__((visibility("hidden")))
 void *memcpy(void *dst, const void *src, size_t n) {
     fast_memcpy(dst, src, n);
@@ -343,7 +343,13 @@ typedef struct {
     char buf[OUT_BUF_CAP];
 } OutStream;
 
+#ifdef DUAL_TU_WORKER
+extern OutStream g_out;
+#elif defined(DUAL_TU_DISPATCH)
+__attribute__((visibility("hidden"))) OutStream g_out;
+#else
 static OutStream g_out;
+#endif
 
 static inline void out_flush(void) {
     uint32_t off = 0;
