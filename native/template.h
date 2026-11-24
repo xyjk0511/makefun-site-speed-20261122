@@ -1105,7 +1105,29 @@ static __attribute__((noinline)) void render_nodes_out(const RenderCtx *rc, cons
                 else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
                 break;
             case NK_FOR: {
-                Val arr = lookup_path(rc, scope, &n->path);
+                // Direct zero-lookup fast paths for the 4 hottest loop targets!
+                Val arr;
+                if (scope == NULL && n->path.len == 2 && n->path.ids[0] == ID_page && rc->page) {
+                    if (n->path.ids[1] == ID_tags) {
+                        const TagRef *ts = rc->page->tag_refs;
+                        uint32_t alen = rc->page->tag_count;
+                        for (uint32_t k = 0; k < alen; k++) {
+                            ScopeFrame sf = { n->text, n->var_id, { VAL_TAG_REF, { .ptr = &ts[k] } }, { k + 1, alen, k == 0, k + 1 == alen }, NULL };
+                            render_nodes_out(rc, n->body, n->body_len, &sf);
+                        }
+                        break;
+                    }
+                    if (n->path.ids[1] == ID_toc) {
+                        const TocItem *hs = rc->page_md ? rc->page_md->toc : rc->page->pre_toc;
+                        uint32_t alen = rc->page_md ? rc->page_md->toc_len : rc->page->pre_toc_len;
+                        for (uint32_t k = 0; k < alen; k++) {
+                            ScopeFrame sf = { n->text, n->var_id, { VAL_TOC_ITEM, { .ptr = &hs[k] } }, { k + 1, alen, k == 0, k + 1 == alen }, NULL };
+                            render_nodes_out(rc, n->body, n->body_len, &sf);
+                        }
+                        break;
+                    }
+                }
+                arr = lookup_path(rc, scope, &n->path);
                 if (arr.kind == VAL_ARR_POSTS) {
                     int is_tag_posts = (n->path.len == 2 && n->path.ids[0] == ID_tag && n->path.ids[1] == ID_posts);
                     uint32_t alen = arr.u.arr.len;

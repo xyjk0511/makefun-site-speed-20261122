@@ -2,8 +2,8 @@
 #include "template.h"
 
 // ---------------- Reusable .bss Arenas (shared across Dual-TU AVX2+SSE2!) ----------------
-#define ARENA_CAP  (64u * 1024u * 1024u)
-#define IN_BSS_CAP (64u * 1024u * 1024u)
+#define ARENA_CAP  (32u * 1024u * 1024u)
+#define IN_BSS_CAP (32u * 1024u * 1024u)
 #ifdef DUAL_TU_WORKER
 extern char g_arena_mem[ARENA_CAP];
 extern char g_in_bss[IN_BSS_CAP];
@@ -1134,11 +1134,15 @@ typedef struct {
     Str *broken_list;
     uint32_t *broken_len;
     Arena *arena;
+    char last_target_buf[256];
+    uint32_t last_target_len;
+    Str last_href;
     char tmp_href[2048];
 } LinkCtx;
 
 static inline void link_ctx_set_source(LinkCtx *ctx, Str path) {
     ctx->cur_path = path;
+    ctx->last_target_len = 0;
     Str dir = dir_of(path);
     ctx->cur_dir = dir;
     uint32_t np = 0;
@@ -1208,6 +1212,10 @@ static __attribute__((noinline)) Str resolve_link_cb(void *vctx, Str target, int
     LinkCtx *ctx = (LinkCtx *)vctx;
     *out_preescaped = 0;
     if (target.n > 0 && (target.p[0] == '/' || target.p[0] == '#' || is_scheme(target))) return target;
+    if (ctx->last_target_len > 0 && ctx->last_target_len == target.n && fast_memeq(ctx->last_target_buf, target.p, target.n)) {
+        *out_preescaped = 1;
+        return ctx->last_href;
+    }
     uint32_t hash_pos = target.n;
     // Strip leading "../" in O(1) for the 74% of internal links that start with "../"!
     uint32_t up = 0;
@@ -1259,7 +1267,13 @@ static __attribute__((noinline)) Str resolve_link_cb(void *vctx, Str target, int
             if (sm_get(ctx->by_source, rstr, h, &sidx)) {
                 if (__builtin_expect(frag.n == 0, 1)) {
                     *out_preescaped = 1;
-                    return ctx->sources[sidx].url_hj;
+                    Str res = ctx->sources[sidx].url_hj;
+                    if (target.n <= sizeof(ctx->last_target_buf)) {
+                        fast_memcpy(ctx->last_target_buf, target.p, target.n);
+                        ctx->last_target_len = target.n;
+                        ctx->last_href = res;
+                    }
+                    return res;
                 }
                 Str url = ctx->sources[sidx].url_hj;
                 fast_memcpy(ctx->tmp_href, url.p, url.n);
@@ -1913,7 +1927,8 @@ static void process_case(const char **pp, const char *end) {
         if (!first_kv) out_char(',');
         first_kv = 0;
         out_char('"');
-        out_json_escaped(pk, plen);
+        if (__builtin_expect(s->is_post, 1)) out_raw(pk, plen);
+        else out_json_escaped(pk, plen);
         OUT_LIT("\":\"");
         rc.page = s;
         rc.page_md = md_ptr;

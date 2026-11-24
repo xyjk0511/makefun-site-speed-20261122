@@ -1,8 +1,8 @@
 #define DUAL_TU_DISPATCH
 #include "markdown.h"
 
-#define ARENA_CAP  (64u * 1024u * 1024u)
-#define IN_BSS_CAP (64u * 1024u * 1024u)
+#define ARENA_CAP  (32u * 1024u * 1024u)
+#define IN_BSS_CAP (32u * 1024u * 1024u)
 
 __attribute__((visibility("hidden"))) char g_arena_mem[ARENA_CAP];
 __attribute__((visibility("hidden"))) char g_in_bss[IN_BSS_CAP];

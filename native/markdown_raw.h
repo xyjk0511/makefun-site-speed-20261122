@@ -805,7 +805,7 @@ static __attribute__((noinline)) char *md_inline_raw_avx2(Buf *out, char *dst, c
     next_rchunk:;
     }
 
-    // 16-byte VEX tail for 16..31B lines/remainders!
+    // 16-byte VEX tail for 16..31B lines/remainders (with \n zero-cycle passthrough!)
     if (i + 16 <= n) {
         const __m128i lo16 = _mm256_castsi256_si128(lo_lut);
         const __m128i hi16 = _mm256_castsi256_si128(hi_lut);
@@ -817,6 +817,13 @@ static __attribute__((noinline)) char *md_inline_raw_avx2(Buf *out, char *dst, c
         __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), v0f16);
         __m128i hit = _mm_and_si128(_mm_shuffle_epi8(lo16, lo), _mm_shuffle_epi8(hi16, hi));
         uint32_t mask = (~(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(hit, vz16))) & 0xFFFFu;
+        if (mask) {
+            uint32_t m_bs = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm256_castsi256_si128(v_bs)));
+            if (m_bs && (m_bs & (m_bs << 1)) == 0) {
+                uint32_t m_n = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm256_castsi256_si128(v_n)));
+                mask &= ~((m_bs & (m_n >> 1)) & 0x7FFFu);
+            }
+        }
         if (mask == 0) { dst += 16; i += 16; }
         else { uint32_t tz = (uint32_t)__builtin_ctz(mask); dst += tz; i += tz; }
     }

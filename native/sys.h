@@ -212,10 +212,66 @@ static inline void detect_cpu_features(void) {
 #endif
 }
 
-// ---------------- Freestanding Fast Memory Ops ----------------
-static inline void fast_memcpy(void *restrict dst, const void *restrict src, size_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
+// ---------------- Freestanding Fast Memory Ops (Zero I-Cache Bloat + AVX2-Native!) ----------------
+static __attribute__((noinline)) void fast_memcpy_var(uint8_t *restrict d, const uint8_t *restrict s, size_t n) {
+#if defined(__AVX2__)
+    if (n <= 32) {
+        if (n >= 16) {
+            __m128i a = _mm_loadu_si128((const __m128i *)s);
+            __m128i b = _mm_loadu_si128((const __m128i *)(s + n - 16));
+            _mm_storeu_si128((__m128i *)d, a);
+            _mm_storeu_si128((__m128i *)(d + n - 16), b);
+            return;
+        }
+        if (n >= 8) {
+            uint64_t a, b;
+            __builtin_memcpy(&a, s, 8);
+            __builtin_memcpy(&b, s + n - 8, 8);
+            __builtin_memcpy(d, &a, 8);
+            __builtin_memcpy(d + n - 8, &b, 8);
+            return;
+        }
+        if (n >= 4) {
+            uint32_t a, b;
+            __builtin_memcpy(&a, s, 4);
+            __builtin_memcpy(&b, s + n - 4, 4);
+            __builtin_memcpy(d, &a, 4);
+            __builtin_memcpy(d + n - 4, &b, 4);
+            return;
+        }
+        if (n >= 2) {
+            uint16_t a;
+            __builtin_memcpy(&a, s, 2);
+            __builtin_memcpy(d, &a, 2);
+            d[n - 1] = s[n - 1];
+            return;
+        }
+        if (n == 1) d[0] = s[0];
+        return;
+    }
+    if (n <= 64) {
+        __m256i a = _mm256_loadu_si256((const __m256i *)s);
+        __m256i b = _mm256_loadu_si256((const __m256i *)(s + n - 32));
+        _mm256_storeu_si256((__m256i *)d, a);
+        _mm256_storeu_si256((__m256i *)(d + n - 32), b);
+        return;
+    }
+    if (n <= 512) {
+        size_t i = 0;
+        for (; i + 64 <= n; i += 64) {
+            __m256i a = _mm256_loadu_si256((const __m256i *)(s + i));
+            __m256i b = _mm256_loadu_si256((const __m256i *)(s + i + 32));
+            _mm256_storeu_si256((__m256i *)(d + i), a);
+            _mm256_storeu_si256((__m256i *)(d + i + 32), b);
+        }
+        if (i + 32 <= n) {
+            _mm256_storeu_si256((__m256i *)(d + i), _mm256_loadu_si256((const __m256i *)(s + i)));
+        }
+        _mm256_storeu_si256((__m256i *)(d + n - 32), _mm256_loadu_si256((const __m256i *)(s + n - 32)));
+        return;
+    }
+    __asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
+#else
     if (n <= 32) {
         if (n >= 16) {
             uint64_t a, b;
@@ -264,6 +320,47 @@ static inline void fast_memcpy(void *restrict dst, const void *restrict src, siz
     }
     while (n--) *d++ = *s++;
 #endif
+#endif
+}
+
+static inline void fast_memcpy(void *restrict dst, const void *restrict src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    if (__builtin_constant_p(n)) {
+        if (n == 0) return;
+        if (n == 1) { d[0] = s[0]; return; }
+        if (n <= 3) {
+            uint16_t a; __builtin_memcpy(&a, s, 2); __builtin_memcpy(d, &a, 2);
+            d[n - 1] = s[n - 1]; return;
+        }
+        if (n <= 7) {
+            uint32_t a, b; __builtin_memcpy(&a, s, 4); __builtin_memcpy(&b, s + n - 4, 4);
+            __builtin_memcpy(d, &a, 4); __builtin_memcpy(d + n - 4, &b, 4); return;
+        }
+        if (n <= 15) {
+            uint64_t a, b; __builtin_memcpy(&a, s, 8); __builtin_memcpy(&b, s + n - 8, 8);
+            __builtin_memcpy(d, &a, 8); __builtin_memcpy(d + n - 8, &b, 8); return;
+        }
+#if defined(__SSE2__)
+        if (n <= 32) {
+            __m128i a = _mm_loadu_si128((const __m128i *)s);
+            __m128i b = _mm_loadu_si128((const __m128i *)(s + n - 16));
+            _mm_storeu_si128((__m128i *)d, a);
+            _mm_storeu_si128((__m128i *)(d + n - 16), b);
+            return;
+        }
+#endif
+#if defined(__AVX2__)
+        if (n <= 64) {
+            __m256i a = _mm256_loadu_si256((const __m256i *)s);
+            __m256i b = _mm256_loadu_si256((const __m256i *)(s + n - 32));
+            _mm256_storeu_si256((__m256i *)d, a);
+            _mm256_storeu_si256((__m256i *)(d + n - 32), b);
+            return;
+        }
+#endif
+    }
+    fast_memcpy_var(d, s, n);
 }
 
 #if !defined(STANDALONE_CLI) && !defined(DUAL_TU_WORKER)
@@ -340,9 +437,9 @@ static inline uint32_t fnv1a_hash(const char *p, uint32_t n) {
     return (uint32_t)h;
 }
 
-// ---------------- 2 MB L3-Hot Output Streamer (4 sys_write gofer RPCs instead of 28!) ----------------
-#define OUT_FLUSH_AT (2u * 1024u * 1024u)
-#define OUT_BUF_CAP  (OUT_FLUSH_AT + 131072u)
+// ---------------- 256 KB L2-Hot Output Streamer (Fits 100% in L2 Cache!) ----------------
+#define OUT_FLUSH_AT 262144u
+#define OUT_BUF_CAP  (OUT_FLUSH_AT + 65536u)
 
 typedef struct {
     int fd;
@@ -358,7 +455,7 @@ __attribute__((visibility("hidden"))) OutStream g_out;
 static OutStream g_out;
 #endif
 
-static inline void out_flush(void) {
+static __attribute__((cold, noinline)) void out_flush(void) {
     uint32_t off = 0;
     while (off < g_out.pos) {
         long w = sys_write(g_out.fd, g_out.buf + off, g_out.pos - off);
