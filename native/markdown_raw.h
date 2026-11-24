@@ -136,38 +136,36 @@ static inline uint32_t words_of_raw(const char *p, uint32_t n) {
 #endif
 }
 
-// ---------------- Raw-JSON Line & Whitespace Helpers (No \r, \u, \/) ----------------
+// ---------------- Raw-JSON Line & Whitespace Helpers (Single-vpmovmskb!) ----------------
+static inline int raw_is_escaped(const char *start, const char *pos) {
+    uint32_t cnt = 0;
+    while (pos > start && pos[-1] == '\\') { pos--; cnt++; }
+    return (int)(cnt & 1u);
+}
+
 static inline const char *find_raw_nl(const char *p, const char *end) {
+    const char *orig = p;
 #if defined(__AVX2__)
     const __m256i v_bs = _mm256_set1_epi8('\\');
     const __m256i v_n  = _mm256_set1_epi8('n');
-    while (p + 32 <= end) {
-        __m256i v = _mm256_loadu_si256((const __m256i *)p);
-        uint32_t m_bs = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_bs));
-        if (m_bs == 0) { p += 32; continue; }
-        if (__builtin_expect((m_bs & (m_bs << 1)) == 0, 1)) {
-            uint32_t m_n = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_n));
-            uint32_t m_nl = m_bs & (m_n >> 1);
-            if (m_nl) return p + __builtin_ctz(m_nl);
-            if ((m_bs >> 31) != 0) {
-                if (p + 32 < end && p[32] == 'n') return p + 31;
-                p += 33;
-                continue;
+    while (p + 33 <= end) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)p);
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(p + 1));
+        uint32_t m = (uint32_t)_mm256_movemask_epi8(
+            _mm256_and_si256(_mm256_cmpeq_epi8(v0, v_bs), _mm256_cmpeq_epi8(v1, v_n))
+        );
+        if (__builtin_expect(m == 0, 1)) { p += 32; continue; }
+        while (m) {
+            uint32_t tz = (uint32_t)__builtin_ctz(m);
+            const char *pos = p + tz;
+            if (__builtin_expect(pos == orig || pos[-1] != '\\' || !raw_is_escaped(orig, pos), 1)) {
+                return pos;
             }
-            p += 32;
-            continue;
+            m &= m - 1u;
         }
-        // Consecutive backslashes inside 32B chunk: step exact JSON escape pairs
-        const char *lim = p + 32;
-        while (p < lim) {
-            if (*p == '\\') {
-                if (p + 1 < end && p[1] == 'n') return p;
-                p += 2;
-            } else {
-                p++;
-            }
-        }
+        p += 32;
     }
+    if (__builtin_expect(p > orig && p[-1] == '\\' && raw_is_escaped(orig, p), 0)) p++;
 #endif
     while (p < end) {
         if (*p == '\\') {
@@ -178,12 +176,6 @@ static inline const char *find_raw_nl(const char *p, const char *end) {
         }
     }
     return end;
-}
-
-static inline int raw_is_escaped(const char *start, const char *pos) {
-    uint32_t cnt = 0;
-    while (pos > start && pos[-1] == '\\') { pos--; cnt++; }
-    return (int)(cnt & 1u);
 }
 
 static inline int md_raw_is_blank(const char *p, uint32_t n) {

@@ -217,10 +217,11 @@ static inline char *inline_ensure(Buf *out, char *dst, uint32_t need) {
 
 #define DST_LIT(dst, s) do { __builtin_memcpy((dst), (s), sizeof(s) - 1); (dst) += sizeof(s) - 1; } while (0)
 
-// Inline fast-path for external/root/anchor links + pre-escaped url_hj for internal links!
+// Inline fast-path for external/root/anchor/mailto links + pre-escaped url_hj for internal links!
 static inline char *emit_md_link_href(Buf *out, char *dst, Str target, uint8_t hdirty, uint32_t extra_need, LinkResolveFn resolve, void *rctx) {
     if (target.p[0] == '/' || target.p[0] == '#' ||
-        (target.n >= 8 && (fast_memeq(target.p, "https://", 8) || fast_memeq(target.p, "http://", 7)))) {
+        (target.n >= 8 && fast_memeq(target.p, "https://", 8)) ||
+        (target.n >= 7 && (fast_memeq(target.p, "http://", 7) || fast_memeq(target.p, "mailto:", 7)))) {
         dst = inline_ensure(out, dst, target.n * 6u + extra_need);
         DST_LIT(dst, "<a href=\\\"");
         if (__builtin_expect(!hdirty, 1)) { fast_memcpy(dst, target.p, target.n); dst += target.n; }
@@ -239,7 +240,7 @@ static inline char *emit_md_link_href(Buf *out, char *dst, Str target, uint8_t h
 }
 
 // ---------------- Pure Scalar Dirty-Tracked Inline Renderer ----------------
-static __attribute__((cold, noinline)) char *md_inline_ptr_scalar(Buf *out, char *dst, const char *s, uint32_t n, LinkResolveFn resolve, void *rctx) {
+static COLD_FALLBACK char *md_inline_ptr_scalar(Buf *out, char *dst, const char *s, uint32_t n, LinkResolveFn resolve, void *rctx) {
     dst = inline_ensure(out, dst, n * 6u + 64u);
     uint32_t i = 0;
     while (i < n) {
@@ -323,7 +324,7 @@ static __attribute__((cold, noinline)) char *md_inline_ptr_scalar(Buf *out, char
 
 // ---------------- Pure-AVX2 + 16B VEX Dirty-Tracked Mask-Draining Inline Renderer ----------------
 #if defined(__AVX2__)
-static __attribute__((cold, noinline)) char *md_inline_ptr_avx2(Buf *out, char *dst, const char *s, uint32_t n, LinkResolveFn resolve, void *rctx) {
+static COLD_FALLBACK char *md_inline_ptr_avx2(Buf *out, char *dst, const char *s, uint32_t n, LinkResolveFn resolve, void *rctx) {
     dst = inline_ensure(out, dst, n * 6u + 512u);
 
     const __m256i lo_lut = _mm256_setr_epi8(
@@ -605,7 +606,7 @@ typedef struct {
     uint32_t toc_len;
 } MdResult;
 
-static __attribute__((cold, noinline)) MdResult render_markdown_json(
+static COLD_FALLBACK MdResult render_markdown_json(
     Str src,
     LinkResolveFn resolve,
     void *rctx,

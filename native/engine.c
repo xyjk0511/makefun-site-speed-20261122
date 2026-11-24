@@ -2,8 +2,8 @@
 #include "template.h"
 
 // ---------------- Reusable .bss Arenas (shared across Dual-TU AVX2+SSE2!) ----------------
-#define ARENA_CAP (32u * 1024u * 1024u)
-#define IN_BSS_CAP (16u * 1024u * 1024u)
+#define ARENA_CAP  (64u * 1024u * 1024u)
+#define IN_BSS_CAP (64u * 1024u * 1024u)
 #ifdef DUAL_TU_WORKER
 extern char g_arena_mem[ARENA_CAP];
 extern char g_in_bss[IN_BSS_CAP];
@@ -24,29 +24,31 @@ static HeadingIdSet g_hset;
 static TocItem g_toc_scratch[1024];
 #endif
 
-// ---------------- Generic Open-Addressed String->u32 Hash Map ----------------
+// ---------------- 1-Cache-Line AoS Open-Addressed String->u32 Hash Map ----------------
 typedef struct {
-    Str *keys;
-    uint32_t *hashes;
-    uint32_t *vals;
-    uint8_t *used;
+    const char *p;
+    uint32_t n;
+    uint32_t hash;
+    uint32_t val;
+} SmEntry;
+
+typedef struct {
+    SmEntry *ent;
     uint32_t mask;
 } StrMap;
 
 static void sm_init(StrMap *m, Arena *a, uint32_t cap_pow2) {
-    m->keys   = (Str *)arena_alloc_aligned(a, cap_pow2 * (uint32_t)sizeof(Str), 8);
-    m->hashes = (uint32_t *)arena_alloc_aligned(a, cap_pow2 * 4u, 4);
-    m->vals   = (uint32_t *)arena_alloc_aligned(a, cap_pow2 * 4u, 4);
-    m->used   = (uint8_t *)arena_alloc_aligned(a, cap_pow2, 8);
-    __builtin_memset(m->used, 0, cap_pow2);
+    m->ent = (SmEntry *)arena_alloc_aligned(a, cap_pow2 * (uint32_t)sizeof(SmEntry), 8);
+    __builtin_memset(m->ent, 0, cap_pow2 * sizeof(SmEntry));
     m->mask = cap_pow2 - 1u;
 }
 
 static inline int sm_get(const StrMap *m, Str k, uint32_t h, uint32_t *out_val) {
     uint32_t idx = h & m->mask;
-    while (m->used[idx]) {
-        if (m->hashes[idx] == h && m->keys[idx].n == k.n && fast_memeq(m->keys[idx].p, k.p, k.n)) {
-            if (out_val) *out_val = m->vals[idx];
+    const SmEntry *ent = m->ent;
+    while (ent[idx].p != NULL) {
+        if (ent[idx].hash == h && ent[idx].n == k.n && fast_memeq(ent[idx].p, k.p, k.n)) {
+            if (out_val) *out_val = ent[idx].val;
             return 1;
         }
         idx = (idx + 1u) & m->mask;
@@ -56,16 +58,17 @@ static inline int sm_get(const StrMap *m, Str k, uint32_t h, uint32_t *out_val) 
 
 static inline int sm_put_new(StrMap *m, Str k, uint32_t h, uint32_t val) {
     uint32_t idx = h & m->mask;
-    while (m->used[idx]) {
-        if (m->hashes[idx] == h && m->keys[idx].n == k.n && fast_memeq(m->keys[idx].p, k.p, k.n)) {
+    SmEntry *ent = m->ent;
+    while (ent[idx].p != NULL) {
+        if (ent[idx].hash == h && ent[idx].n == k.n && fast_memeq(ent[idx].p, k.p, k.n)) {
             return 0;
         }
         idx = (idx + 1u) & m->mask;
     }
-    m->used[idx] = 1;
-    m->hashes[idx] = h;
-    m->keys[idx] = k;
-    m->vals[idx] = val;
+    ent[idx].p = k.p ? k.p : "";
+    ent[idx].n = k.n;
+    ent[idx].hash = h;
+    ent[idx].val = val;
     return 1;
 }
 
@@ -83,7 +86,7 @@ static inline uint32_t next_pow2(uint32_t v) {
 typedef struct { Str path; Str raw_json; uint8_t raw_flags; } InputFile;
 typedef struct { Str name; Str src; } InputTpl;
 
-static __attribute__((cold, noinline)) void sort_tpls(InputTpl *arr, int lo, int hi) {
+static COLD_FN void sort_tpls(InputTpl *arr, int lo, int hi) {
     while (lo < hi) {
         int i = lo, j = hi;
         Str piv = arr[(lo + hi) >> 1].name;
@@ -162,7 +165,7 @@ static void sort_tags(TagData *arr, int lo, int hi) {
     }
 }
 
-static __attribute__((cold, noinline)) void sort_strs(Str *arr, int lo, int hi) {
+static COLD_FN void sort_strs(Str *arr, int lo, int hi) {
     while (lo < hi) {
         int i = lo, j = hi;
         Str piv = arr[(lo + hi) >> 1];
@@ -199,7 +202,7 @@ static inline uint32_t parse_u4(const char *p) {
 }
 
 #if defined(__AVX2__)
-static Str parse_json_str_avx2(const char **pp, const char *end, Arena *a, int norm_cr, int *out_has_cr) {
+static __attribute__((noinline)) Str parse_json_str_avx2(const char **pp, const char *end, Arena *a, int norm_cr, int *out_has_cr) {
     const char *p = *pp + 1; // skip opening '"'
     const char *start = p;
     const __m256i v_qt = _mm256_set1_epi8('"');
@@ -396,12 +399,10 @@ static __attribute__((noinline)) Str skip_json_str_raw(const char **pp, const ch
         uint32_t m_bs = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_bs));
         uint32_t m_qt = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_qt));
         acc_bs |= m_bs;
-        if (m_bs | prev_bs) {
-            uint32_t m_r  = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_r));
-            uint32_t m_su = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v, v_sl), _mm256_cmpeq_epi8(v, v_u)));
-            acc_r  |= (m_bs & (m_r >> 1))  | (prev_bs & (m_r & 1u));
-            acc_su |= (m_bs & (m_su >> 1)) | (prev_bs & (m_su & 1u));
-        }
+        uint32_t m_r  = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_r));
+        uint32_t m_su = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v, v_sl), _mm256_cmpeq_epi8(v, v_u)));
+        acc_r  |= (m_bs & (m_r >> 1))  | (prev_bs & (m_r & 1u));
+        acc_su |= (m_bs & (m_su >> 1)) | (prev_bs & (m_su & 1u));
         if (__builtin_expect(m_qt == 0, 1)) {
             if (__builtin_expect((m_bs >> 31) == 0, 1)) {
                 prev_bs = 0;
@@ -477,7 +478,7 @@ static __attribute__((noinline)) Str skip_json_str_raw(const char **pp, const ch
 }
 
 // Mask-draining AVX2 JSON unescape into L1-hot reusable scratch buffer (with CR norm & 32B zero pad!)
-static __attribute__((cold, noinline)) uint32_t unescape_raw_into(Str raw, char *dst_start, int norm_cr) {
+static COLD_FALLBACK uint32_t unescape_raw_into(Str raw, char *dst_start, int norm_cr) {
     const char *p = raw.p;
     const char *end = raw.p + raw.n;
     char *dst = dst_start;
@@ -625,7 +626,7 @@ static inline Str arena_dup_str(Arena *a, Str s) {
 // Unescape ONLY the frontmatter prefix (up to closing "---") from raw JSON string!
 // Returns 1 if closed frontmatter extracted into fm_dst (body_raw set to remainder in input JSON),
 // returns 0 if no opening "---" (reason=1), unclosed (reason=2), or too large (reason=3 -> fallback).
-static int extract_fm_from_raw(Str raw, char *fm_dst, uint32_t fm_cap, uint32_t *out_fm_len, Str *out_body_raw, int *out_reason) {
+static __attribute__((noinline)) int extract_fm_from_raw(Str raw, char *fm_dst, uint32_t fm_cap, uint32_t *out_fm_len, Str *out_body_raw, int *out_reason) {
     const char *p = raw.p;
     const char *end = raw.p + raw.n;
     char *dst = fm_dst;
@@ -719,7 +720,7 @@ static int extract_fm_from_raw(Str raw, char *fm_dst, uint32_t fm_cap, uint32_t 
     return 0;
 }
 
-static __attribute__((cold, noinline)) void skip_json_val(const char **pp, const char *end);
+static COLD_FN void skip_json_val(const char **pp, const char *end);
 
 static uint32_t parse_json_uint(const char **pp, const char *end) {
     const char *p = *pp;
@@ -823,7 +824,7 @@ typedef struct {
     Str err;
 } FmResult;
 
-static __attribute__((cold, noinline)) Str make_refused_str(Arena *a, Str path, const char *msg1, Str mid, const char *msg2) {
+static COLD_FN Str make_refused_str(Arena *a, Str path, const char *msg1, Str mid, const char *msg2) {
     char tmp[1024];
     Buf b = { tmp, 0, sizeof(tmp) };
     BUF_LIT(&b, "refused ");
@@ -1124,6 +1125,7 @@ typedef struct {
     Str cur_path;
     Str cur_dir;
     Str dir_parts[32];
+    Str dir_prefixes[33]; // dir_prefixes[k] = first k segments joined by '/' (0..dir_nparts)
     uint32_t dir_nparts;
     const PostData *sources;
     const StrMap *by_source;
@@ -1140,11 +1142,16 @@ static inline void link_ctx_set_source(LinkCtx *ctx, Str path) {
     Str dir = dir_of(path);
     ctx->cur_dir = dir;
     uint32_t np = 0;
+    ctx->dir_prefixes[0] = (Str){ "", 0 };
     if (dir.n > 0) {
         uint32_t s = 0;
         for (uint32_t i = 0; i <= dir.n; i++) {
             if (i == dir.n || dir.p[i] == '/') {
-                if (np < 32) ctx->dir_parts[np++] = (Str){ dir.p + s, i - s };
+                if (np < 32) {
+                    ctx->dir_parts[np] = (Str){ dir.p + s, i - s };
+                    np++;
+                    ctx->dir_prefixes[np] = (Str){ dir.p, i };
+                }
                 s = i + 1;
             }
         }
@@ -1180,7 +1187,7 @@ static inline int resolve_rel_path_pre(const Str *dir_parts, uint32_t dir_nparts
     return 1;
 }
 
-static __attribute__((cold, noinline)) void record_broken_link(LinkCtx *ctx, Str target) {
+static COLD_FN void record_broken_link(LinkCtx *ctx, Str target) {
     uint32_t blen = 12 + ctx->cur_path.n + 4 + target.n;
     char btmp[2048];
     fast_memcpy(btmp, "broken-link ", 12);
@@ -1197,55 +1204,74 @@ static __attribute__((cold, noinline)) void record_broken_link(LinkCtx *ctx, Str
     }
 }
 
-static Str resolve_link_cb(void *vctx, Str target, int *out_preescaped) {
+static __attribute__((noinline)) Str resolve_link_cb(void *vctx, Str target, int *out_preescaped) {
     LinkCtx *ctx = (LinkCtx *)vctx;
     *out_preescaped = 0;
     if (target.n > 0 && (target.p[0] == '/' || target.p[0] == '#' || is_scheme(target))) return target;
     uint32_t hash_pos = target.n;
-    int simple_rel = (target.n > 0 && target.p[0] != '.');
-    for (uint32_t i = 0; i < target.n; i++) {
+    // Strip leading "../" in O(1) for the 74% of internal links that start with "../"!
+    uint32_t up = 0;
+    uint32_t start = 0;
+    while (start + 3 <= target.n && target.p[start] == '.' && target.p[start + 1] == '.' && target.p[start + 2] == '/') {
+        up++;
+        start += 3;
+    }
+    int simple_tail = (start < target.n && target.p[start] != '.');
+    for (uint32_t i = start; i < target.n; i++) {
         char ch = target.p[i];
         if (ch == '#') { hash_pos = i; break; }
-        if (ch == '/' && (i + 1 >= target.n || target.p[i + 1] == '.' || target.p[i + 1] == '/')) simple_rel = 0;
+        if (ch == '/' && (i + 1 >= target.n || target.p[i + 1] == '.' || target.p[i + 1] == '/')) simple_tail = 0;
     }
     Str rel = { target.p, hash_pos };
     Str frag = { target.p + hash_pos, target.n - hash_pos };
     if (rel.n > 0) {
         char rbuf[1024];
-        uint32_t rlen = 0;
+        Str rstr = { NULL, 0 };
         int ok = 1;
-        if (__builtin_expect(simple_rel && ctx->cur_dir.n + 1 + rel.n < sizeof(rbuf), 1)) {
-            if (ctx->cur_dir.n > 0) {
-                fast_memcpy(rbuf, ctx->cur_dir.p, ctx->cur_dir.n);
-                rbuf[ctx->cur_dir.n] = '/';
-                fast_memcpy(rbuf + ctx->cur_dir.n + 1, rel.p, rel.n);
-                rlen = ctx->cur_dir.n + 1 + rel.n;
+        if (__builtin_expect(simple_tail && up <= ctx->dir_nparts && hash_pos > start, 1)) {
+            uint32_t keep = ctx->dir_nparts - up;
+            const char *tp = target.p + start;
+            uint32_t tn = hash_pos - start;
+            if (keep == 0) {
+                // Zero-copy! e.g., "../../assets/img/tree-3.svg" from depth 2 -> "assets/img/tree-3.svg"
+                rstr = (Str){ tp, tn };
             } else {
-                fast_memcpy(rbuf, rel.p, rel.n);
-                rlen = rel.n;
+                Str pfx = ctx->dir_prefixes[keep];
+                if (__builtin_expect(pfx.n + 1 + tn < sizeof(rbuf), 1)) {
+                    fast_memcpy(rbuf, pfx.p, pfx.n);
+                    rbuf[pfx.n] = '/';
+                    fast_memcpy(rbuf + pfx.n + 1, tp, tn);
+                    rstr = (Str){ rbuf, pfx.n + 1 + tn };
+                } else {
+                    uint32_t rlen = 0;
+                    ok = resolve_rel_path_pre(ctx->dir_parts, ctx->dir_nparts, rel, rbuf, &rlen);
+                    rstr = (Str){ rbuf, rlen };
+                }
             }
         } else {
+            uint32_t rlen = 0;
             ok = resolve_rel_path_pre(ctx->dir_parts, ctx->dir_nparts, rel, rbuf, &rlen);
+            rstr = (Str){ rbuf, rlen };
         }
         if (ok) {
-            Str rstr = { rbuf, rlen };
-            uint32_t h = fnv1a_hash(rbuf, rlen);
+            uint32_t h = fnv1a_hash(rstr.p, rstr.n);
             uint32_t sidx;
             if (sm_get(ctx->by_source, rstr, h, &sidx)) {
                 if (__builtin_expect(frag.n == 0, 1)) {
                     *out_preescaped = 1;
                     return ctx->sources[sidx].url_hj;
                 }
-                Str url = ctx->sources[sidx].url;
+                Str url = ctx->sources[sidx].url_hj;
                 fast_memcpy(ctx->tmp_href, url.p, url.n);
-                fast_memcpy(ctx->tmp_href + url.n, frag.p, frag.n);
-                return (Str){ ctx->tmp_href, url.n + frag.n };
+                char *endp = html_json_escape_scalar(ctx->tmp_href + url.n, frag.p, frag.n);
+                *out_preescaped = 1;
+                return (Str){ ctx->tmp_href, (uint32_t)(endp - ctx->tmp_href) };
             }
             if (sm_get(ctx->static_paths, rstr, h, NULL)) {
                 uint32_t pos = 0;
                 fast_memcpy(ctx->tmp_href, ctx->base.p, ctx->base.n); pos += ctx->base.n;
                 ctx->tmp_href[pos++] = '/';
-                fast_memcpy(ctx->tmp_href + pos, rbuf, rlen); pos += rlen;
+                fast_memcpy(ctx->tmp_href + pos, rstr.p, rstr.n); pos += rstr.n;
                 if (frag.n) { fast_memcpy(ctx->tmp_href + pos, frag.p, frag.n); pos += frag.n; }
                 return (Str){ ctx->tmp_href, pos };
             }
@@ -1264,10 +1290,10 @@ static void process_case(const char **pp, const char *end) {
     Str site_title = { "", 0 }, site_base_raw = { "", 0 };
     uint32_t site_per_page = 10, site_recent = 5;
 
-    InputTpl *in_tpls = (InputTpl *)arena_alloc_aligned(&arena, 256u * (uint32_t)sizeof(InputTpl), 8);
+    InputTpl *in_tpls = (InputTpl *)arena_alloc_aligned(&arena, 512u * (uint32_t)sizeof(InputTpl), 8);
     uint32_t in_tpl_count = 0;
 
-    InputFile *in_files = (InputFile *)arena_alloc_aligned(&arena, 4096u * (uint32_t)sizeof(InputFile), 8);
+    InputFile *in_files = (InputFile *)arena_alloc_aligned(&arena, 16384u * (uint32_t)sizeof(InputFile), 8);
     uint32_t in_file_count = 0;
 
     skip_ws(pp, end);
@@ -1311,7 +1337,7 @@ static void process_case(const char **pp, const char *end) {
                         skip_ws(pp, end); if (**pp == ':') (*pp)++;
                         skip_ws(pp, end);
                         Str ts = parse_json_str(pp, end, &arena, 0, NULL);
-                        if (in_tpl_count < 256u) {
+                        if (in_tpl_count < 512u) {
                             in_tpls[in_tpl_count].name = tn;
                             in_tpls[in_tpl_count].src = ts;
                             in_tpl_count++;
@@ -1344,7 +1370,7 @@ static void process_case(const char **pp, const char *end) {
                             skip_ws(pp, end);
                             if (*pp < end && **pp == ',') (*pp)++;
                         }
-                        if (in_file_count < 4096u) {
+                        if (in_file_count < 16384u) {
                             in_files[in_file_count].path = fp;
                             in_files[in_file_count].raw_json = fraw;
                             in_files[in_file_count].raw_flags = rflags;
@@ -1371,7 +1397,7 @@ static void process_case(const char **pp, const char *end) {
     while (base.n > 0 && base.p[base.n - 1] == '/') base.n--;
 
     // Report lines array
-    Str *report = (Str *)arena_alloc_aligned(&arena, 8192u * (uint32_t)sizeof(Str), 8);
+    Str *report = (Str *)arena_alloc_aligned(&arena, 16384u * (uint32_t)sizeof(Str), 8);
     uint32_t report_len = 0;
 
     // 1. Parse templates in code-unit order
@@ -1708,10 +1734,11 @@ static void process_case(const char **pp, const char *end) {
 
     if (tags_len > 1) sort_tags(tags_arr, 0, (int)tags_len - 1);
 
-    // Prepare broken-link set & scratch buffers for Markdown
+    // Prepare broken-link set & scratch buffers for Markdown (sized to src_count to minimize zeroing!)
     StrMap broken_set;
-    sm_init(&broken_set, &arena, 4096);
-    Str *broken_list = (Str *)arena_alloc_aligned(&arena, 4096u * (uint32_t)sizeof(Str), 8);
+    uint32_t broken_cap = next_pow2(src_count + 128u);
+    sm_init(&broken_set, &arena, broken_cap);
+    Str *broken_list = (Str *)arena_alloc_aligned(&arena, broken_cap * (uint32_t)sizeof(Str), 8);
     uint32_t broken_len = 0;
 
     Buf md_buf = { g_md_buf_init, 0, sizeof(g_md_buf_init) };
@@ -1842,16 +1869,18 @@ static void process_case(const char **pp, const char *end) {
             link_ctx_set_source(&lctx, s->path);
             id_arena.pos = 0;
 #if defined(__AVX2__)
+            uint32_t tcap = lt->uses_toc[1] ? 1024u : 0u;
             if (__builtin_expect(s->body_raw_has_cr && !(s->body_raw_flags & (RAW_HAS_CR | RAW_HAS_NEEDS_REESC)), 1)) {
                 if (!s->words_computed && (s->is_post || lt->uses_readmin[1])) {
                     uint32_t w = words_of_raw(s->body_raw.p, s->body_raw.n);
                     s->reading_minutes = (w == 0) ? 1u : (w + 199u) / 200u;
                     s->words_computed = 1;
                 }
-                md = render_markdown_raw_json(s->body_raw, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, 1024);
+                md = render_markdown_raw_json(s->body_raw, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, tcap);
             } else
 #endif
             {
+                uint32_t tcap2 = lt->uses_toc[1] ? 1024u : 0u;
                 Str body; char *bmmap; uint32_t bcap;
                 LOAD_BODY(s, body, bmmap, bcap);
                 if (!s->words_computed && (s->is_post || lt->uses_readmin[1])) {
@@ -1859,7 +1888,7 @@ static void process_case(const char **pp, const char *end) {
                     s->reading_minutes = (w == 0) ? 1u : (w + 199u) / 200u;
                     s->words_computed = 1;
                 }
-                md = render_markdown_json(body, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, 1024);
+                md = render_markdown_json(body, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, tcap2);
                 if (bmmap) sys_munmap(bmmap, bcap);
             }
             md_ptr = &md;
@@ -1888,7 +1917,7 @@ static void process_case(const char **pp, const char *end) {
         OUT_LIT("\":\"");
         rc.page = s;
         rc.page_md = md_ptr;
-        render_nodes(&rc, lt->baked_nodes[1], lt->baked_len[1], NULL, NULL, 0);
+        render_nodes_out(&rc, lt->baked_nodes[1], lt->baked_len[1], NULL);
         out_char('"');
     }
     rc.page = NULL;
@@ -1948,7 +1977,7 @@ static void process_case(const char **pp, const char *end) {
             rc.posts = posts + pstart;
             rc.posts_len = pend - pstart;
             rc.pager = &pg;
-            render_nodes(&rc, t_index->baked_nodes[2], t_index->baked_len[2], NULL, NULL, 0);
+            render_nodes_out(&rc, t_index->baked_nodes[2], t_index->baked_len[2], NULL);
             out_char('"');
         }
         rc.posts = NULL;
@@ -1973,7 +2002,7 @@ static void process_case(const char **pp, const char *end) {
             out_raw(pk, pklen); // slug is [a-z0-9-]!
             OUT_LIT("\":\"");
             rc.tag = td;
-            render_nodes(&rc, t_tag->baked_nodes[3], t_tag->baked_len[3], NULL, NULL, 0);
+            render_nodes_out(&rc, t_tag->baked_nodes[3], t_tag->baked_len[3], NULL);
             out_char('"');
         }
         rc.tag = NULL;
@@ -1986,7 +2015,7 @@ static void process_case(const char **pp, const char *end) {
         if (!first_kv) out_char(',');
         first_kv = 0;
         OUT_LIT("\"tags/index.html\":\"");
-        render_nodes(&rc, t_tags->baked_nodes[4], t_tags->baked_len[4], NULL, NULL, 0);
+        render_nodes_out(&rc, t_tags->baked_nodes[4], t_tags->baked_len[4], NULL);
         out_char('"');
     }
 

@@ -294,6 +294,7 @@ typedef struct {
     uint32_t baked_len[5];
     uint8_t baked_ready[5];
     uint8_t uses_readmin[5];
+    uint8_t uses_toc[5];
 } Template;
 
 // ---------------- Template Parser (100% Exact Error Messages) ----------------
@@ -335,7 +336,7 @@ static int is_valid_tpl_name(Str s) {
     return 1;
 }
 
-static __attribute__((cold, noinline)) Str make_tpl_err(Arena *a, Str name, const char *part1, Str mid, int quote_mid, const char *part2) {
+static COLD_FN Str make_tpl_err(Arena *a, Str name, const char *part1, Str mid, int quote_mid, const char *part2) {
     Buf b;
     char tmp[1024];
     b.p = tmp; b.n = 0; b.cap = sizeof(tmp);
@@ -387,7 +388,7 @@ typedef struct {
     TNode header;
 } ParseFrame;
 
-static __attribute__((cold, noinline)) int parse_template(Str name, Str src, Arena *a, TNode **out_nodes, uint32_t *out_len, Str *out_err) {
+static COLD_FN int parse_template(Str name, Str src, Arena *a, TNode **out_nodes, uint32_t *out_len, Str *out_err) {
     ParseFrame stack[64];
     uint32_t sp = 0;
     stack[0].kind = 0;
@@ -803,7 +804,7 @@ static inline int val_truthy(Val v) {
 }
 
 // Emit pre-JSON-escaped string as HTML-escaped JSON string (rare fallback if template uses {{ page.content }})
-static __attribute__((cold, noinline)) void emit_prejson_html_escaped(Buf *dst, Str s) {
+static COLD_FN void emit_prejson_html_escaped(Buf *dst, Str s) {
     for (uint32_t i = 0; i < s.n; i++) {
         char c = s.p[i];
         if (c == '\\' && i + 1 < s.n) {
@@ -890,8 +891,296 @@ static inline void emit_pre_hj(Buf *dst, Str s) {
     else out_raw(s.p, s.n);
 }
 
-// General streaming renderer (dst == NULL -> streams directly into 256 KB L2 g_out!)
-static __attribute__((noinline)) void render_nodes(const RenderCtx *rc, const TNode *nodes, uint32_t len, const ScopeFrame *scope, Buf *dst, int depth) {
+// Dedicated HOT streaming renderer directly into 256 KB L2 g_out (ZERO `if (dst)` branches!)
+static COLD_FN void render_nodes(const RenderCtx *rc, const TNode *nodes, uint32_t len, const ScopeFrame *scope, Buf *dst, int depth);
+
+static __attribute__((noinline)) void render_nodes_out(const RenderCtx *rc, const TNode *nodes, uint32_t len, const ScopeFrame *scope) {
+    for (uint32_t i = 0; i < len; i++) {
+        const TNode *n = &nodes[i];
+        switch (n->kind) {
+            case NK_TEXT:
+                out_raw(n->text.p, n->text.n);
+                break;
+            case NK_P_TITLE_HJ:
+                out_raw(rc->page->title_hj.p, rc->page->title_hj.n);
+                break;
+            case NK_P_CONTENT_RAW: {
+                Str c = rc->page_md ? rc->page_md->html : rc->page->pre_html_json;
+                out_raw(c.p, c.n);
+                break;
+            }
+            case NK_P_DATE:
+                out_raw(rc->page->date.p, rc->page->date.n);
+                break;
+            case NK_P_DATE_LONG:
+                out_raw(rc->page->date_long.p, rc->page->date_long.n);
+                break;
+            case NK_P_READMIN:
+                out_u32(rc->page->reading_minutes);
+                break;
+            case NK_P_URL_HJ:
+                out_raw(rc->page->url_hj.p, rc->page->url_hj.n);
+                break;
+            case NK_P_SLUG:
+                out_raw(rc->page->slug.p, rc->page->slug.n);
+                break;
+            case NK_P_SUMMARY_HJ:
+                out_raw(rc->page->summary_hj.p, rc->page->summary_hj.n);
+                break;
+            case NK_P_EXCERPT_RAW: {
+                Str ex = rc->page_md ? rc->page_md->excerpt : rc->page->excerpt_json;
+                out_raw(ex.p, ex.n);
+                break;
+            }
+            case NK_P_NEWER_URL_HJ:
+                if (rc->page->newer_idx >= 0) {
+                    Str s = rc->sorted_posts[rc->page->newer_idx]->url_hj;
+                    out_raw(s.p, s.n);
+                }
+                break;
+            case NK_P_NEWER_TITLE_HJ:
+                if (rc->page->newer_idx >= 0) {
+                    Str s = rc->sorted_posts[rc->page->newer_idx]->title_hj;
+                    out_raw(s.p, s.n);
+                }
+                break;
+            case NK_P_OLDER_URL_HJ:
+                if (rc->page->older_idx >= 0) {
+                    Str s = rc->sorted_posts[rc->page->older_idx]->url_hj;
+                    out_raw(s.p, s.n);
+                }
+                break;
+            case NK_P_OLDER_TITLE_HJ:
+                if (rc->page->older_idx >= 0) {
+                    Str s = rc->sorted_posts[rc->page->older_idx]->title_hj;
+                    out_raw(s.p, s.n);
+                }
+                break;
+            case NK_TAG_NAME_HJ:
+                out_raw(rc->tag->name_hj.p, rc->tag->name_hj.n);
+                break;
+            case NK_TAG_COUNT:
+                out_u32(rc->tag->post_count);
+                break;
+            case NK_PG_NUM:
+                out_u32(rc->pager->number);
+                break;
+            case NK_PG_TOT:
+                out_u32(rc->pager->total);
+                break;
+            case NK_PG_URL_HJ:
+                out_html_json_escaped(rc->pager->url.p, rc->pager->url.n);
+                break;
+            case NK_PG_NEW_HJ:
+                out_html_json_escaped(rc->pager->newer_url.p, rc->pager->newer_url.n);
+                break;
+            case NK_PG_OLD_HJ:
+                out_html_json_escaped(rc->pager->older_url.p, rc->pager->older_url.n);
+                break;
+            case NK_SC_T_URL_HJ: {
+                Str s = ((const TagRef *)scope->var_val.u.ptr)->url_hj;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_SC_T_NAME_HJ: {
+                Str s = ((const TagRef *)scope->var_val.u.ptr)->name_hj;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_SC_T_SLUG: {
+                Str s = ((const TagRef *)scope->var_val.u.ptr)->slug;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_SC_H_LEVEL:
+                out_char((char)('0' + ((const TocItem *)scope->var_val.u.ptr)->level));
+                break;
+            case NK_SC_H_ID: {
+                Str s = ((const TocItem *)scope->var_val.u.ptr)->id;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_SC_H_HTML_RAW: {
+                Str s = ((const TocItem *)scope->var_val.u.ptr)->html;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_SC_P_TITLE_HJ: {
+                Str s = ((const PostData *)scope->var_val.u.ptr)->title_hj;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_SC_P_URL_HJ: {
+                Str s = ((const PostData *)scope->var_val.u.ptr)->url_hj;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_SC_P_DATE: {
+                Str s = ((const PostData *)scope->var_val.u.ptr)->date;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_SC_P_DATE_LONG: {
+                Str s = ((const PostData *)scope->var_val.u.ptr)->date_long;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_SC_P_READMIN:
+                out_u32(((const PostData *)scope->var_val.u.ptr)->reading_minutes);
+                break;
+            case NK_SC_P_SUMMARY_HJ: {
+                Str s = ((const PostData *)scope->var_val.u.ptr)->summary_hj;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_SC_P_EXCERPT_RAW: {
+                Str s = ((const PostData *)scope->var_val.u.ptr)->excerpt_json;
+                out_raw(s.p, s.n);
+                break;
+            }
+            case NK_IF_P_DATE:
+                if ((rc->page->date.n > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_P_TAGS:
+                if ((rc->page->tag_count > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_P_TOC: {
+                uint32_t tl = rc->page_md ? rc->page_md->toc_len : rc->page->pre_toc_len;
+                if ((tl > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            }
+            case NK_IF_P_NEWER:
+                if ((rc->page->newer_idx >= 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_P_OLDER:
+                if ((rc->page->older_idx >= 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_P_SUMMARY:
+                if ((rc->page->summary.n > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_P_IS_POST:
+                if ((rc->page->is_post != 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_PG_NEW:
+                if ((rc->pager->newer_url.n > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_PG_OLD:
+                if ((rc->pager->older_url.n > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_SC_T_URL:
+                if ((((const TagRef *)scope->var_val.u.ptr)->url.n > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_SC_P_DATE:
+                if ((((const PostData *)scope->var_val.u.ptr)->date.n > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_SC_P_TAGS:
+                if ((((const PostData *)scope->var_val.u.ptr)->tag_count > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_SC_P_SUMMARY:
+                if ((((const PostData *)scope->var_val.u.ptr)->summary.n > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_SC_P_EXCERPT:
+                if ((((const PostData *)scope->var_val.u.ptr)->excerpt_json.n > 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_LP_FIRST:
+                if ((scope->loop.first != 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_IF_LP_LAST:
+                if ((scope->loop.last != 0) != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            case NK_FOR: {
+                Val arr = lookup_path(rc, scope, &n->path);
+                if (arr.kind == VAL_ARR_POSTS) {
+                    int is_tag_posts = (n->path.len == 2 && n->path.ids[0] == ID_tag && n->path.ids[1] == ID_posts);
+                    uint32_t alen = arr.u.arr.len;
+                    for (uint32_t k = 0; k < alen; k++) {
+                        PostData *post = is_tag_posts
+                            ? rc->sorted_posts[((const uint32_t *)arr.u.arr.ptr)[k]]
+                            : ((PostData *const *)arr.u.arr.ptr)[k];
+                        if (n->card_slot >= 0) {
+                            int slot = n->card_slot;
+                            if (post->card_cached[slot]) {
+                                out_raw(post->card_cache[slot].p, post->card_cache[slot].n);
+                                continue;
+                            }
+                            char ctmp[4096];
+                            Buf cb = { ctmp, 0, sizeof(ctmp) };
+                            ScopeFrame sf = { n->text, n->var_id, { VAL_CARD, { .ptr = post } }, { k + 1, alen, k == 0, k + 1 == alen }, scope };
+                            render_nodes(rc, n->body, n->body_len, &sf, &cb, 0);
+                            char *saved = arena_alloc(rc->card_arena, cb.n);
+                            fast_memcpy(saved, cb.p, cb.n);
+                            post->card_cache[slot] = (Str){ saved, cb.n };
+                            post->card_cached[slot] = 1;
+                            out_raw(saved, cb.n);
+                            if (cb.cap > sizeof(ctmp)) sys_munmap(cb.p, cb.cap);
+                            continue;
+                        }
+                        ScopeFrame sf = { n->text, n->var_id, { VAL_CARD, { .ptr = post } }, { k + 1, alen, k == 0, k + 1 == alen }, scope };
+                        render_nodes_out(rc, n->body, n->body_len, &sf);
+                    }
+                } else if (arr.kind == VAL_ARR_TAG_REFS) {
+                    const TagRef *ts = (const TagRef *)arr.u.arr.ptr;
+                    uint32_t alen = arr.u.arr.len;
+                    for (uint32_t k = 0; k < alen; k++) {
+                        ScopeFrame sf = { n->text, n->var_id, { VAL_TAG_REF, { .ptr = &ts[k] } }, { k + 1, alen, k == 0, k + 1 == alen }, scope };
+                        render_nodes_out(rc, n->body, n->body_len, &sf);
+                    }
+                } else if (arr.kind == VAL_ARR_TOC) {
+                    const TocItem *hs = (const TocItem *)arr.u.arr.ptr;
+                    uint32_t alen = arr.u.arr.len;
+                    for (uint32_t k = 0; k < alen; k++) {
+                        ScopeFrame sf = { n->text, n->var_id, { VAL_TOC_ITEM, { .ptr = &hs[k] } }, { k + 1, alen, k == 0, k + 1 == alen }, scope };
+                        render_nodes_out(rc, n->body, n->body_len, &sf);
+                    }
+                } else if (arr.kind == VAL_ARR_TAGS_ALL) {
+                    const TagData *ts = (const TagData *)arr.u.arr.ptr;
+                    uint32_t alen = arr.u.arr.len;
+                    for (uint32_t k = 0; k < alen; k++) {
+                        ScopeFrame sf = { n->text, n->var_id, { VAL_TAG_ALL, { .ptr = &ts[k] } }, { k + 1, alen, k == 0, k + 1 == alen }, scope };
+                        render_nodes_out(rc, n->body, n->body_len, &sf);
+                    }
+                }
+                break;
+            }
+            case NK_VAR:
+                emit_val(NULL, lookup_path(rc, scope, &n->path), 1);
+                break;
+            case NK_RAW:
+                emit_val(NULL, lookup_path(rc, scope, &n->path), 0);
+                break;
+            case NK_IF: {
+                int tv = val_truthy(lookup_path(rc, scope, &n->path));
+                if (tv != (int)n->is_not) render_nodes_out(rc, n->body, n->body_len, scope);
+                else if (n->else_body) render_nodes_out(rc, n->else_body, n->else_len, scope);
+                break;
+            }
+            case NK_INCLUDE: {
+                Template *t = find_template(rc, n->text);
+                if (t) render_nodes(rc, t->nodes, t->len, scope, NULL, 1);
+                break;
+            }
+        }
+    }
+}
+
+// General buffer/card-fill/site-bake renderer (cold -Os!)
+static COLD_FN void render_nodes(const RenderCtx *rc, const TNode *nodes, uint32_t len, const ScopeFrame *scope, Buf *dst, int depth) {
     for (uint32_t i = 0; i < len; i++) {
         const TNode *n = &nodes[i];
         switch (n->kind) {
@@ -1227,7 +1516,7 @@ static __attribute__((noinline)) void render_nodes(const RenderCtx *rc, const TN
 
 // ---------------- Layout-Specialized AST Optimizer ----------------
 // Step 1: Inline all {% include %} up to INCLUDE_DEPTH
-static __attribute__((cold, noinline)) void inline_ast(const RenderCtx *rc, const TNode *in, uint32_t len, int depth, NodeVec *out, Arena *a) {
+static COLD_FN void inline_ast(const RenderCtx *rc, const TNode *in, uint32_t len, int depth, NodeVec *out, Arena *a) {
     for (uint32_t i = 0; i < len; i++) {
         TNode n = in[i];
         if (n.kind == NK_INCLUDE) {
@@ -1328,7 +1617,7 @@ static uint32_t dep_of_nodes(const TNode *nodes, uint32_t len, DepScope *ds) {
 }
 
 // Check if two AST node arrays are structurally identical (for sharing card_cache[0] between index & tag!)
-static __attribute__((cold, noinline)) int ast_equal(const TNode *a, uint32_t alen, const TNode *b, uint32_t blen) {
+static COLD_FN int ast_equal(const TNode *a, uint32_t alen, const TNode *b, uint32_t blen) {
     if (alen != blen) return 0;
     for (uint32_t i = 0; i < alen; i++) {
         if (a[i].kind != b[i].kind || a[i].is_not != b[i].is_not || a[i].var_id != b[i].var_id) return 0;
@@ -1360,7 +1649,7 @@ static inline int is_shadowed_by_scope(uint8_t id, const DepScope *ds) {
 }
 
 // Step 2: Layout-specialized dead-branch elimination + site-constant folding + adjacent literal coalescing + opcode lowering!
-static __attribute__((cold, noinline)) void bake_nodes(const RenderCtx *rc, const TNode *in, uint32_t len, uint8_t layout_kind, DepScope *ds, NodeVec *out, Arena *a, Buf *lit_acc) {
+static COLD_FN void bake_nodes(const RenderCtx *rc, const TNode *in, uint32_t len, uint8_t layout_kind, DepScope *ds, NodeVec *out, Arena *a, Buf *lit_acc) {
     #define FLUSH_LIT() do { \
         if (lit_acc->n > 0) { \
             char *cp = arena_alloc(a, lit_acc->n); \
@@ -1593,22 +1882,21 @@ static __attribute__((cold, noinline)) void bake_nodes(const RenderCtx *rc, cons
     #undef FLUSH_LIT
 }
 
-static __attribute__((cold, noinline)) int ast_uses_readmin(const TNode *nodes, uint32_t len) {
+static COLD_FN int ast_uses_ident(const TNode *nodes, uint32_t len, uint8_t target_id) {
     for (uint32_t i = 0; i < len; i++) {
         const TNode *n = &nodes[i];
-        if (n->kind == NK_P_READMIN || n->kind == NK_SC_P_READMIN) return 1;
         if (n->kind != NK_TEXT && n->kind != NK_INCLUDE) {
             for (uint8_t k = 0; k < n->path.len; k++) {
-                if (n->path.ids[k] == ID_reading_minutes) return 1;
+                if (n->path.ids[k] == target_id) return 1;
             }
         }
-        if (n->body && ast_uses_readmin(n->body, n->body_len)) return 1;
-        if (n->else_body && ast_uses_readmin(n->else_body, n->else_len)) return 1;
+        if (n->body && ast_uses_ident(n->body, n->body_len, target_id)) return 1;
+        if (n->else_body && ast_uses_ident(n->else_body, n->else_len, target_id)) return 1;
     }
     return 0;
 }
 
-static __attribute__((cold, noinline)) void compile_layout(const RenderCtx *rc, Template *t, uint8_t layout_kind, Arena *a) {
+static COLD_FN void compile_layout(const RenderCtx *rc, Template *t, uint8_t layout_kind, Arena *a) {
     if (!t || t->baked_ready[layout_kind]) return;
     NodeVec inlined = {0, 0, 0};
     inline_ast(rc, t->nodes, t->len, 0, &inlined, a);
@@ -1626,11 +1914,12 @@ static __attribute__((cold, noinline)) void compile_layout(const RenderCtx *rc, 
     t->baked_nodes[layout_kind] = baked.arr;
     t->baked_len[layout_kind] = baked.len;
     t->baked_ready[layout_kind] = 1;
-    t->uses_readmin[layout_kind] = (uint8_t)ast_uses_readmin(baked.arr, baked.len);
+    t->uses_readmin[layout_kind] = (uint8_t)ast_uses_ident(baked.arr, baked.len, ID_reading_minutes);
+    t->uses_toc[layout_kind] = (uint8_t)ast_uses_ident(baked.arr, baked.len, ID_toc);
 }
 
 // After compiling both `index` and `tag`, unify card_slot = 0 if their card loop bodies match!
-static __attribute__((cold, noinline)) void unify_card_cache_slots(Template *t_index, Template *t_tag) {
+static COLD_FN void unify_card_cache_slots(Template *t_index, Template *t_tag) {
     if (!t_index || !t_tag || !t_index->baked_ready[2] || !t_tag->baked_ready[3]) return;
     const TNode *idx_loop = NULL;
     for (uint32_t i = 0; i < t_index->baked_len[2]; i++) {

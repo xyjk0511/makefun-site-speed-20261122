@@ -2,6 +2,13 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#define COLD_FN __attribute__((optimize("Os"), cold, noinline))
+#if defined(__AVX2__)
+#define COLD_FALLBACK __attribute__((optimize("Os"), cold, noinline))
+#else
+#define COLD_FALLBACK __attribute__((noinline))
+#endif
+
 #if defined(__x86_64__)
 #include <immintrin.h>
 #elif defined(__aarch64__)
@@ -333,9 +340,9 @@ static inline uint32_t fnv1a_hash(const char *p, uint32_t n) {
     return (uint32_t)h;
 }
 
-// ---------------- 256 KB L2-Hot Output Streamer ----------------
-#define OUT_FLUSH_AT 262144
-#define OUT_BUF_CAP  (OUT_FLUSH_AT + 65536)
+// ---------------- 2 MB L3-Hot Output Streamer (4 sys_write gofer RPCs instead of 28!) ----------------
+#define OUT_FLUSH_AT (2u * 1024u * 1024u)
+#define OUT_BUF_CAP  (OUT_FLUSH_AT + 131072u)
 
 typedef struct {
     int fd;
