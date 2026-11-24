@@ -371,8 +371,8 @@ static inline void out_char(char c) {
     if (__builtin_expect(g_out.pos >= OUT_FLUSH_AT, 0)) out_flush();
 }
 
-static inline void out_raw(const char *p, uint32_t n) {
-    if (__builtin_expect(n > 65536, 0)) {
+static __attribute__((cold, noinline)) void out_raw_slow(const char *p, uint32_t n) {
+    if (n > 65536u) {
         out_flush();
         uint32_t off = 0;
         while (off < n) {
@@ -383,10 +383,20 @@ static inline void out_raw(const char *p, uint32_t n) {
         }
         return;
     }
-    if (__builtin_expect(g_out.pos + n >= OUT_BUF_CAP, 0)) out_flush();
+    if (g_out.pos + n >= OUT_BUF_CAP) out_flush();
     fast_memcpy(g_out.buf + g_out.pos, p, n);
     g_out.pos += n;
-    if (__builtin_expect(g_out.pos >= OUT_FLUSH_AT, 0)) out_flush();
+    if (g_out.pos >= OUT_FLUSH_AT) out_flush();
+}
+
+static inline void out_raw(const char *p, uint32_t n) {
+    uint32_t pos = g_out.pos;
+    if (__builtin_expect(n < OUT_FLUSH_AT - pos, 1)) {
+        fast_memcpy(g_out.buf + pos, p, n);
+        g_out.pos = pos + n;
+        return;
+    }
+    out_raw_slow(p, n);
 }
 
 static inline void out_lit(const char *s, uint32_t n) {

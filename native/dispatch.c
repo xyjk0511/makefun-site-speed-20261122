@@ -9,6 +9,7 @@ __attribute__((visibility("hidden"))) char g_in_bss[IN_BSS_CAP];
 __attribute__((visibility("hidden"))) char g_id_arena_mem[65536];
 __attribute__((visibility("hidden"))) char g_md_buf_init[131072];
 __attribute__((visibility("hidden"))) char g_join_buf_init[65536];
+__attribute__((visibility("hidden"))) char g_body_scratch[65536 + 64];
 __attribute__((visibility("hidden"))) HeadingIdSet g_hset;
 __attribute__((visibility("hidden"))) TocItem g_toc_scratch[1024];
 

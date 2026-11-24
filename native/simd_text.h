@@ -32,7 +32,7 @@ typedef struct {
     uint32_t cap;
 } Buf;
 
-static inline void buf_grow(Buf *b, uint32_t need) {
+static __attribute__((cold, noinline)) void buf_grow(Buf *b, uint32_t need) {
     uint32_t ncap = b->cap ? b->cap * 2u : 65536u;
     while (ncap < b->n + need) ncap *= 2u;
     char *np = (char *)sys_mmap(NULL, ncap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -288,8 +288,24 @@ static uint32_t words_of_scalar_tail(const uint8_t *cur, const uint8_t *end, uin
 }
 
 #if defined(__AVX2__)
+static inline int is_utf8_ws_at(const uint8_t *p, const uint8_t *end) {
+    uint8_t b0 = p[0];
+    if (b0 == 0xC2) return (p + 1 < end && p[1] == 0xA0);
+    if (p + 2 >= end) return 0;
+    uint8_t b1 = p[1], b2 = p[2];
+    if (b0 == 0xE2) {
+        if (b1 == 0x80) return (b2 >= 0x80 && b2 <= 0x8A) || b2 == 0xA8 || b2 == 0xA9 || b2 == 0xAF;
+        return (b1 == 0x81 && b2 == 0x9F);
+    }
+    if (b0 == 0xE1) return (b1 == 0x9A && b2 == 0x80);
+    if (b0 == 0xE3) return (b1 == 0x80 && b2 == 0x80);
+    if (b0 == 0xEF) return (b1 == 0xBB && b2 == 0xBF);
+    return 0;
+}
+
 static uint32_t words_of_avx2(const char *p, uint32_t n) {
     const uint8_t *s = (const uint8_t *)p;
+    const uint8_t *end = s + n;
     uint32_t i = 0, count = 0;
     uint64_t prev_ws = 1;
     const __m256i v_sp = _mm256_set1_epi8(' ');
@@ -299,14 +315,21 @@ static uint32_t words_of_avx2(const char *p, uint32_t n) {
     const __m256i v_f0 = _mm256_set1_epi8((char)0xF0);
     const __m256i v_e0 = _mm256_set1_epi8((char)0xE0);
 
-    // 64 bytes/iter unrolled AVX2! Only falls back on potential Unicode WS lead bytes (0xC2, 0xE0..0xEF)!
+    // 64B/iter unrolled AVX2! Non-whitespace UTF-8 (em-dash, curly quotes, middot) NEVER falls back!
     while (i + 64 <= n) {
         __m256i v0 = _mm256_loadu_si256((const __m256i *)(s + i));
         __m256i v1 = _mm256_loadu_si256((const __m256i *)(s + i + 32));
         __m256i u0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, v_c2), _mm256_cmpeq_epi8(_mm256_and_si256(v0, v_f0), v_e0));
         __m256i u1 = _mm256_or_si256(_mm256_cmpeq_epi8(v1, v_c2), _mm256_cmpeq_epi8(_mm256_and_si256(v1, v_f0), v_e0));
-        if (__builtin_expect(_mm256_movemask_epi8(_mm256_or_si256(u0, u1)) != 0, 0)) {
-            goto slow32;
+        uint64_t um0 = (uint32_t)_mm256_movemask_epi8(u0);
+        uint64_t um1 = (uint32_t)_mm256_movemask_epi8(u1);
+        uint64_t um = um0 | (um1 << 32);
+        if (__builtin_expect(um != 0, 0)) {
+            while (um) {
+                uint32_t pos = (uint32_t)__builtin_ctzll(um);
+                if (__builtin_expect(is_utf8_ws_at(s + i + pos, end), 0)) goto slow64;
+                um &= um - 1ULL;
+            }
         }
         __m256i d0 = _mm256_sub_epi8(v0, v_9);
         __m256i ws0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, v_sp), _mm256_cmpeq_epi8(_mm256_min_epu8(d0, v_4), d0));
@@ -320,9 +343,9 @@ static uint32_t words_of_avx2(const char *p, uint32_t n) {
         prev_ws = wm >> 63;
         i += 64;
         continue;
-    slow32:
+    slow64:
         {
-            const uint8_t *cur = s + i, *end = s + n;
+            const uint8_t *cur = s + i;
             uint32_t lim = i + 64;
             int in_word = !prev_ws;
             while ((uint32_t)(cur - s) < lim && cur < end) {
@@ -347,7 +370,16 @@ static uint32_t words_of_avx2(const char *p, uint32_t n) {
     while (i + 32 <= n) {
         __m256i v0 = _mm256_loadu_si256((const __m256i *)(s + i));
         __m256i u0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, v_c2), _mm256_cmpeq_epi8(_mm256_and_si256(v0, v_f0), v_e0));
-        if (__builtin_expect(_mm256_movemask_epi8(u0) != 0, 0)) break;
+        uint32_t um = (uint32_t)_mm256_movemask_epi8(u0);
+        if (__builtin_expect(um != 0, 0)) {
+            int real_ws = 0;
+            while (um) {
+                uint32_t pos = (uint32_t)__builtin_ctz(um);
+                if (is_utf8_ws_at(s + i + pos, end)) { real_ws = 1; break; }
+                um &= um - 1u;
+            }
+            if (real_ws) break;
+        }
         __m256i d0 = _mm256_sub_epi8(v0, v_9);
         __m256i ws0 = _mm256_or_si256(_mm256_cmpeq_epi8(v0, v_sp), _mm256_cmpeq_epi8(_mm256_min_epu8(d0, v_4), d0));
         uint32_t wm = (uint32_t)_mm256_movemask_epi8(ws0);
@@ -356,7 +388,7 @@ static uint32_t words_of_avx2(const char *p, uint32_t n) {
         prev_ws = wm >> 31;
         i += 32;
     }
-    if (i < n) count += words_of_scalar_tail(s + i, s + n, (uint32_t)prev_ws);
+    if (i < n) count += words_of_scalar_tail(s + i, end, (uint32_t)prev_ws);
     return count;
 }
 #endif
@@ -432,33 +464,85 @@ static inline const char *find_nl(const char *p, const char *end) {
 }
 #endif
 
-// ---------------- Escaping Helpers (Mask-Draining AVX2 + Fast LUT Scalar) ----------------
-static const char HEX_LC[16] = "0123456789abcdef";
+// ---------------- Branchless 2-Instruction Escaping Tables ----------------
+typedef struct {
+    char s[7];
+    uint8_t len;
+} EscEntry;
 
+#ifdef DUAL_TU_WORKER
+extern const EscEntry HJ_ESC_TBL[128];
+extern const EscEntry JSON_ESC_TBL[128];
+#else
+#ifdef DUAL_TU_DISPATCH
+__attribute__((visibility("hidden")))
+#else
+static
+#endif
+const EscEntry HJ_ESC_TBL[128] = {
+    [0]  = {"\\u0000", 6}, [1]  = {"\\u0001", 6}, [2]  = {"\\u0002", 6}, [3]  = {"\\u0003", 6},
+    [4]  = {"\\u0004", 6}, [5]  = {"\\u0005", 6}, [6]  = {"\\u0006", 6}, [7]  = {"\\u0007", 6},
+    [8]  = {"\\b",     2}, [9]  = {"\\t",     2}, [10] = {"\\n",     2}, [11] = {"\\u000b", 6},
+    [12] = {"\\f",     2}, [13] = {"\\r",     2}, [14] = {"\\u000e", 6}, [15] = {"\\u000f", 6},
+    [16] = {"\\u0010", 6}, [17] = {"\\u0011", 6}, [18] = {"\\u0012", 6}, [19] = {"\\u0013", 6},
+    [20] = {"\\u0014", 6}, [21] = {"\\u0015", 6}, [22] = {"\\u0016", 6}, [23] = {"\\u0017", 6},
+    [24] = {"\\u0018", 6}, [25] = {"\\u0019", 6}, [26] = {"\\u001a", 6}, [27] = {"\\u001b", 6},
+    [28] = {"\\u001c", 6}, [29] = {"\\u001d", 6}, [30] = {"\\u001e", 6}, [31] = {"\\u001f", 6},
+    ['"']  = {"&quot;", 6},
+    ['&']  = {"&amp;",  5},
+    ['\''] = {"&#39;",  5},
+    ['<']  = {"&lt;",   4},
+    ['>']  = {"&gt;",   4},
+    ['\\'] = {"\\\\",   2},
+};
+
+#ifdef DUAL_TU_DISPATCH
+__attribute__((visibility("hidden")))
+#else
+static
+#endif
+const EscEntry JSON_ESC_TBL[128] = {
+    [0]  = {"\\u0000", 6}, [1]  = {"\\u0001", 6}, [2]  = {"\\u0002", 6}, [3]  = {"\\u0003", 6},
+    [4]  = {"\\u0004", 6}, [5]  = {"\\u0005", 6}, [6]  = {"\\u0006", 6}, [7]  = {"\\u0007", 6},
+    [8]  = {"\\b",     2}, [9]  = {"\\t",     2}, [10] = {"\\n",     2}, [11] = {"\\u000b", 6},
+    [12] = {"\\f",     2}, [13] = {"\\r",     2}, [14] = {"\\u000e", 6}, [15] = {"\\u000f", 6},
+    [16] = {"\\u0010", 6}, [17] = {"\\u0011", 6}, [18] = {"\\u0012", 6}, [19] = {"\\u0013", 6},
+    [20] = {"\\u0014", 6}, [21] = {"\\u0015", 6}, [22] = {"\\u0016", 6}, [23] = {"\\u0017", 6},
+    [24] = {"\\u0018", 6}, [25] = {"\\u0019", 6}, [26] = {"\\u001a", 6}, [27] = {"\\u001b", 6},
+    [28] = {"\\u001c", 6}, [29] = {"\\u001d", 6}, [30] = {"\\u001e", 6}, [31] = {"\\u001f", 6},
+    ['"']  = {"\\\"",   2},
+    ['\\'] = {"\\\\",   2},
+};
+#endif
+
+// Branchless 2-instruction escape (dst MUST have >= 8 bytes slack!)
 static inline uint32_t emit_json_ctrl(char *dst, uint8_t c) {
-    if (c == '"')  { dst[0] = '\\'; dst[1] = '"';  return 2; }
-    if (c == '\\') { dst[0] = '\\'; dst[1] = '\\'; return 2; }
-    if (c == '\n') { dst[0] = '\\'; dst[1] = 'n';  return 2; }
-    if (c == '\r') { dst[0] = '\\'; dst[1] = 'r';  return 2; }
-    if (c == '\t') { dst[0] = '\\'; dst[1] = 't';  return 2; }
-    if (c == '\b') { dst[0] = '\\'; dst[1] = 'b';  return 2; }
-    if (c == '\f') { dst[0] = '\\'; dst[1] = 'f';  return 2; }
-    dst[0] = '\\'; dst[1] = 'u'; dst[2] = '0'; dst[3] = '0';
-    dst[4] = HEX_LC[c >> 4]; dst[5] = HEX_LC[c & 15];
-    return 6;
+    uint64_t w;
+    __builtin_memcpy(&w, &JSON_ESC_TBL[c & 127u], 8);
+    __builtin_memcpy(dst, &w, 8);
+    return (uint32_t)(w >> 56);
 }
 
 static inline uint32_t emit_html_json_char(char *dst, uint8_t c) {
-    if (c == '&')  { fast_memcpy(dst, "&amp;", 5);  return 5; }
-    if (c == '<')  { fast_memcpy(dst, "&lt;", 4);   return 4; }
-    if (c == '>')  { fast_memcpy(dst, "&gt;", 4);   return 4; }
-    if (c == '"')  { fast_memcpy(dst, "&quot;", 6); return 6; }
-    if (c == '\'') { fast_memcpy(dst, "&#39;", 5);  return 5; }
-    return emit_json_ctrl(dst, c);
+    uint64_t w;
+    __builtin_memcpy(&w, &HJ_ESC_TBL[c & 127u], 8);
+    __builtin_memcpy(dst, &w, 8);
+    return (uint32_t)(w >> 56);
 }
 
 #if defined(__AVX2__)
-static char *json_escape_avx2(char *dst, const char *src, uint32_t n) {
+// Ultra-fast 1..31B copy for padded src (>=32B slack) & padded dst (>=32B slack): ZERO size-branch tree!
+static inline void copy_short_padded(char *dst, const char *src, uint32_t n) {
+    if (n <= 16u) {
+        _mm_storeu_si128((__m128i *)dst, _mm_loadu_si128((const __m128i *)src));
+    } else {
+        _mm256_storeu_si256((__m256i *)dst, _mm256_loadu_si256((const __m256i *)src));
+    }
+}
+#endif
+
+#if defined(__AVX2__)
+static __attribute__((noinline)) char *json_escape_avx2(char *dst, const char *src, uint32_t n) {
     const __m256i v_qt = _mm256_set1_epi8('"');
     const __m256i v_bs = _mm256_set1_epi8('\\');
     const __m256i v_hi = _mm256_set1_epi8((char)0xE0);
@@ -498,7 +582,7 @@ static char *json_escape_avx2(char *dst, const char *src, uint32_t n) {
     return dst;
 }
 
-static char *html_json_escape_avx2(char *dst, const char *src, uint32_t n) {
+static __attribute__((noinline)) char *html_json_escape_avx2(char *dst, const char *src, uint32_t n) {
     const __m256i lo_lut = _mm256_setr_epi8(
         0, 0, 1, 0, 0, 0, 2, 4, 0, 0, 0, 0, 8 | 32, 0, 16, 0,
         0, 0, 1, 0, 0, 0, 2, 4, 0, 0, 0, 0, 8 | 32, 0, 16, 0

@@ -3,8 +3,21 @@
 #include <stdint.h>
 
 typedef struct { uint32_t lo, hi; } NfkdMRange;
-static const uint32_t NFKD_M_COUNT = 328;
-static const NfkdMRange NFKD_M_RANGES[328] = {
+typedef struct { uint32_t cp; uint16_t off; uint8_t len; } NfkdAlnum;
+#define NFKD_M_COUNT 328u
+#define NFKD_ALNUM_COUNT 1937u
+
+#ifdef DUAL_TU_WORKER
+extern const NfkdMRange NFKD_M_RANGES[328];
+extern const char NFKD_POOL[774];
+extern const NfkdAlnum NFKD_ALNUM[1937];
+#else
+#ifdef DUAL_TU_DISPATCH
+__attribute__((visibility("hidden")))
+#else
+static
+#endif
+const NfkdMRange NFKD_M_RANGES[328] = {
   {0x300,0x36f},{0x483,0x489},{0x591,0x5bd},{0x5bf,0x5bf},{0x5c1,0x5c2},{0x5c4,0x5c5},
   {0x5c7,0x5c7},{0x610,0x61a},{0x64b,0x65f},{0x670,0x670},{0x6d6,0x6dc},{0x6df,0x6e4},
   {0x6e7,0x6e8},{0x6ea,0x6ed},{0x711,0x711},{0x730,0x74a},{0x7a6,0x7b0},{0x7eb,0x7f3},
@@ -62,10 +75,18 @@ static const NfkdMRange NFKD_M_RANGES[328] = {
   {0x1e6f5,0x1e6f5},{0x1e8d0,0x1e8d6},{0x1e944,0x1e94a},{0xe0100,0xe01ef},
 };
 
-typedef struct { uint32_t cp; uint16_t off; uint8_t len; } NfkdAlnum;
-static const uint32_t NFKD_ALNUM_COUNT = 1937;
-static const char NFKD_POOL[774] = "a231o1-41-23-4ceinuydghijjkll--nrstwzdzljnjxbmpvfa-0456789rsa-ca-s-cc-oc-u-fnoqsmteltmfax1-71-91-101-32-31-52-53-54-51-65-61-83-85-87-81-iiiiiivviviiviiiixxixii0-31011121314151617181920-1--2--3--4--5--6--7--8--9--10--11--12--13--14--15--16--17--18--19--20-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16-17-18-19-20--a--b--c--d--e--f--g--h--i--j--k--l--m--n--o--p--q--r--s--t--u--v--w--x--y--z-pte212223242526272829303132333435363738394041424344454647484950hgergevltd0-21-22-23-24-hpadaaubarovpcdmdm2dm3iupana-amakakbmbgbcalkcalpfnf-gmgkghzkhzmhzghzthz-lmldlklfmnm-mmmcmkmmm2cm2m2km2mm3cm3m3km3m-sm-s2kpampagparadrad-srad-s2psns-smspvnv-vmvkvpwnw-wmwkwk-m-a-m-bqcccdc-kgco-dbgyhahpinkkktlmlnloglxmilmolphp-m-ppmprsrsvwbv-ma-m25-26-27-28-29-30-31-galfffiflffifflstwzhvsdssppvwcmcmdmrdj";
-static const NfkdAlnum NFKD_ALNUM[1937] = {
+#ifdef DUAL_TU_DISPATCH
+__attribute__((visibility("hidden")))
+#else
+static
+#endif
+const char NFKD_POOL[774] = "a231o1-41-23-4ceinuydghijjkll--nrstwzdzljnjxbmpvfa-0456789rsa-ca-s-cc-oc-u-fnoqsmteltmfax1-71-91-101-32-31-52-53-54-51-65-61-83-85-87-81-iiiiiivviviiviiiixxixii0-31011121314151617181920-1--2--3--4--5--6--7--8--9--10--11--12--13--14--15--16--17--18--19--20-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16-17-18-19-20--a--b--c--d--e--f--g--h--i--j--k--l--m--n--o--p--q--r--s--t--u--v--w--x--y--z-pte212223242526272829303132333435363738394041424344454647484950hgergevltd0-21-22-23-24-hpadaaubarovpcdmdm2dm3iupana-amakakbmbgbcalkcalpfnf-gmgkghzkhzmhzghzthz-lmldlklfmnm-mmmcmkmmm2cm2m2km2mm3cm3m3km3m-sm-s2kpampagparadrad-srad-s2psns-smspvnv-vmvkvpwnw-wmwkwk-m-a-m-bqcccdc-kgco-dbgyhahpinkkktlmlnloglxmilmolphp-m-ppmprsrsvwbv-ma-m25-26-27-28-29-30-31-galfffiflffifflstwzhvsdssppvwcmcmdmrdj";
+#ifdef DUAL_TU_DISPATCH
+__attribute__((visibility("hidden")))
+#else
+static
+#endif
+const NfkdAlnum NFKD_ALNUM[1937] = {
   {0xaa,0,1},{0xb2,1,1},{0xb3,2,1},{0xb9,3,1},{0xba,4,1},{0xbc,5,3},
   {0xbd,8,3},{0xbe,11,3},{0xc0,0,1},{0xc1,0,1},{0xc2,0,1},{0xc3,0,1},
   {0xc4,0,1},{0xc5,0,1},{0xc7,14,1},{0xc8,15,1},{0xc9,15,1},{0xca,15,1},
@@ -390,3 +411,4 @@ static const NfkdAlnum NFKD_ALNUM[1937] = {
   {0x1f190,771,2},{0x1fbf0,51,1},{0x1fbf1,3,1},{0x1fbf2,1,1},{0x1fbf3,2,1},{0x1fbf4,52,1},
   {0x1fbf5,53,1},{0x1fbf6,54,1},{0x1fbf7,55,1},{0x1fbf8,56,1},{0x1fbf9,57,1},
 };
+#endif

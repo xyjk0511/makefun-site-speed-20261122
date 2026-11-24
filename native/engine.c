@@ -10,6 +10,7 @@ extern char g_in_bss[IN_BSS_CAP];
 extern char g_id_arena_mem[65536];
 extern char g_md_buf_init[131072];
 extern char g_join_buf_init[65536];
+extern char g_body_scratch[65536 + 64];
 extern HeadingIdSet g_hset;
 extern TocItem g_toc_scratch[1024];
 #else
@@ -18,6 +19,7 @@ static char g_in_bss[IN_BSS_CAP];
 static char g_id_arena_mem[65536];
 static char g_md_buf_init[131072];
 static char g_join_buf_init[65536];
+static char g_body_scratch[65536 + 64];
 static HeadingIdSet g_hset;
 static TocItem g_toc_scratch[1024];
 #endif
@@ -74,10 +76,14 @@ static inline uint32_t next_pow2(uint32_t v) {
 }
 
 // ---------------- Fast In-Place Sorting Helpers ----------------
-typedef struct { Str path; Str content; int has_cr; } InputFile;
+#define RAW_HAS_BS         1u
+#define RAW_HAS_CR         2u
+#define RAW_HAS_NEEDS_REESC 4u
+
+typedef struct { Str path; Str raw_json; uint8_t raw_flags; } InputFile;
 typedef struct { Str name; Str src; } InputTpl;
 
-static void sort_tpls(InputTpl *arr, int lo, int hi) {
+static __attribute__((cold, noinline)) void sort_tpls(InputTpl *arr, int lo, int hi) {
     while (lo < hi) {
         int i = lo, j = hi;
         Str piv = arr[(lo + hi) >> 1].name;
@@ -156,7 +162,7 @@ static void sort_tags(TagData *arr, int lo, int hi) {
     }
 }
 
-static void sort_strs(Str *arr, int lo, int hi) {
+static __attribute__((cold, noinline)) void sort_strs(Str *arr, int lo, int hi) {
     while (lo < hi) {
         int i = lo, j = hi;
         Str piv = arr[(lo + hi) >> 1];
@@ -372,6 +378,349 @@ static inline Str parse_json_str(const char **pp, const char *end, Arena *a, int
 #endif
 }
 
+// Zero-write 3-instruction SIMDJSON-style raw JSON string scanner (skips ALL \n with ZERO loop!)
+static __attribute__((noinline)) Str skip_json_str_raw(const char **pp, const char *end, uint8_t *out_flags) {
+    const char *p = *pp + 1;
+    const char *start = p;
+    uint8_t flags = 0;
+#if defined(__AVX2__)
+    const __m256i v_qt = _mm256_set1_epi8('"');
+    const __m256i v_bs = _mm256_set1_epi8('\\');
+    const __m256i v_r  = _mm256_set1_epi8('r');
+    const __m256i v_sl = _mm256_set1_epi8('/');
+    const __m256i v_u  = _mm256_set1_epi8('u');
+    uint32_t prev_bs = 0; // 1 if previous chunk ended with an ODD run of backslashes
+    uint32_t acc_r = 0, acc_su = 0, acc_bs = 0;
+    while (p + 32 <= end) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)p);
+        uint32_t m_bs = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_bs));
+        uint32_t m_qt = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_qt));
+        acc_bs |= m_bs;
+        if (m_bs | prev_bs) {
+            uint32_t m_r  = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_r));
+            uint32_t m_su = (uint32_t)_mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(v, v_sl), _mm256_cmpeq_epi8(v, v_u)));
+            acc_r  |= (m_bs & (m_r >> 1))  | (prev_bs & (m_r & 1u));
+            acc_su |= (m_bs & (m_su >> 1)) | (prev_bs & (m_su & 1u));
+        }
+        if (__builtin_expect(m_qt == 0, 1)) {
+            if (__builtin_expect((m_bs >> 31) == 0, 1)) {
+                prev_bs = 0;
+            } else if (m_bs == 0xFFFFFFFFu) {
+                // 32 backslashes -> even, prev_bs unchanged
+            } else {
+                prev_bs = (uint32_t)__builtin_clz(~m_bs) & 1u;
+            }
+            p += 32;
+            continue;
+        }
+        // Has at least one '"'! Fast-path when no consecutive '\\' inside this chunk!
+        if (__builtin_expect(((m_bs & (m_bs << 1)) == 0) && !(prev_bs & (m_bs & 1u)), 1)) {
+            uint32_t m_unesc_qt = m_qt & ~((m_bs << 1) | prev_bs);
+            if (m_unesc_qt == 0) {
+                prev_bs = m_bs >> 31;
+                p += 32;
+                continue;
+            }
+            uint32_t tz = (uint32_t)__builtin_ctz(m_unesc_qt);
+            *pp = p + tz + 1;
+            if (acc_bs) flags |= RAW_HAS_BS;
+            if (acc_r)  flags |= RAW_HAS_CR;
+            if (acc_su) flags |= (RAW_HAS_CR | RAW_HAS_NEEDS_REESC);
+            if (out_flags) *out_flags = flags;
+            return (Str){ start, (uint32_t)((p + tz) - start) };
+        }
+        // Rare: consecutive '\\' AND '"' in the same 32B chunk -> exact scalar step over this 32B chunk!
+        const char *lim = p + 32;
+        if (prev_bs) { p++; prev_bs = 0; }
+        while (p < lim) {
+            char c = *p++;
+            if (c == '"') {
+                *pp = p;
+                if (acc_bs) flags |= RAW_HAS_BS;
+                if (acc_r)  flags |= RAW_HAS_CR;
+                if (acc_su) flags |= (RAW_HAS_CR | RAW_HAS_NEEDS_REESC);
+                if (out_flags) *out_flags = flags;
+                return (Str){ start, (uint32_t)((p - 1) - start) };
+            }
+            if (c == '\\') {
+                if (p < lim) { p++; }
+                else { prev_bs = 1; }
+            }
+        }
+    }
+    if (acc_bs) flags |= RAW_HAS_BS;
+    if (acc_r)  flags |= RAW_HAS_CR;
+    if (acc_su) flags |= (RAW_HAS_CR | RAW_HAS_NEEDS_REESC);
+    if (prev_bs && p < end) {
+        char e = *p++;
+        if (e == 'r') flags |= RAW_HAS_CR;
+        else if (e == '/' || e == 'u') flags |= (RAW_HAS_CR | RAW_HAS_NEEDS_REESC);
+    }
+#endif
+    while (p < end) {
+        char c = *p++;
+        if (c == '"') {
+            *pp = p;
+            if (out_flags) *out_flags = flags;
+            return (Str){ start, (uint32_t)((p - 1) - start) };
+        }
+        if (c == '\\' && p < end) {
+            flags |= RAW_HAS_BS;
+            char e = *p++;
+            if (e == 'r') flags |= RAW_HAS_CR;
+            else if (e == '/' || e == 'u') flags |= (RAW_HAS_CR | RAW_HAS_NEEDS_REESC);
+        }
+    }
+    *pp = p;
+    if (out_flags) *out_flags = flags;
+    return (Str){ start, (uint32_t)(p - start) };
+}
+
+// Mask-draining AVX2 JSON unescape into L1-hot reusable scratch buffer (with CR norm & 32B zero pad!)
+static __attribute__((cold, noinline)) uint32_t unescape_raw_into(Str raw, char *dst_start, int norm_cr) {
+    const char *p = raw.p;
+    const char *end = raw.p + raw.n;
+    char *dst = dst_start;
+#if defined(__AVX2__)
+    const __m256i v_bs = _mm256_set1_epi8('\\');
+    while (p + 32 <= end) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)p);
+        _mm256_storeu_si256((__m256i *)dst, v);
+        uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, v_bs));
+        if (__builtin_expect(m == 0, 1)) { dst += 32; p += 32; continue; }
+        const char *base = p;
+        uint32_t cur = 0;
+        while (m) {
+            uint32_t tz = (uint32_t)__builtin_ctz(m);
+            uint32_t run = tz - cur;
+            if (cur == 0) dst += run;
+            else if (run) { fast_memcpy(dst, base + cur, run); dst += run; }
+            if (tz + 1 < 32u) {
+                char e = base[tz + 1];
+                if (__builtin_expect(e == 'n', 1)) {
+                    *dst++ = '\n';
+                    if (tz + 2 < 32u) { cur = tz + 2; m &= (~0u << cur); continue; }
+                    p = base + 32; goto next_u32;
+                }
+                if (e == '"' || e == '\\' || e == '/') {
+                    *dst++ = e;
+                    if (tz + 2 < 32u) { cur = tz + 2; m &= (~0u << cur); continue; }
+                    p = base + 32; goto next_u32;
+                }
+                if (e == 't') {
+                    *dst++ = '\t';
+                    if (tz + 2 < 32u) { cur = tz + 2; m &= (~0u << cur); continue; }
+                    p = base + 32; goto next_u32;
+                }
+            }
+            // Rare escape (\r, \u, \b, \f) or backslash at byte 31 -> scalar handle then resume!
+            p = base + tz + 1;
+            if (p >= end) goto done_u;
+            char e = *p++;
+            switch (e) {
+                case 'n':  *dst++ = '\n'; break;
+                case '"':  *dst++ = '"';  break;
+                case '\\': *dst++ = '\\'; break;
+                case '/':  *dst++ = '/';  break;
+                case 't':  *dst++ = '\t'; break;
+                case 'b':  *dst++ = '\b'; break;
+                case 'f':  *dst++ = '\f'; break;
+                case 'r':
+                    if (norm_cr) {
+                        *dst++ = '\n';
+                        if (p + 1 < end && p[0] == '\\' && p[1] == 'n') p += 2;
+                    } else {
+                        *dst++ = '\r';
+                    }
+                    break;
+                case 'u':
+                    if (p + 4 <= end) {
+                        uint32_t cp = parse_u4(p);
+                        p += 4;
+                        if (cp >= 0xD800 && cp <= 0xDBFF && p + 6 <= end && p[0] == '\\' && p[1] == 'u') {
+                            uint32_t lo = parse_u4(p + 2);
+                            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000u + (((cp - 0xD800u) << 10) | (lo - 0xDC00u));
+                                p += 6;
+                            }
+                        }
+                        if (cp == '\r' && norm_cr) {
+                            *dst++ = '\n';
+                            if (p + 1 < end && p[0] == '\\' && p[1] == 'n') p += 2;
+                        } else {
+                            dst += utf8_encode(cp, dst);
+                        }
+                    }
+                    break;
+                default: *dst++ = e; break;
+            }
+            if (p < base + 32) {
+                cur = (uint32_t)(p - base);
+                m &= (~0u << cur);
+                continue;
+            }
+            goto next_u32;
+        }
+        if (cur < 32u) { fast_memcpy(dst, base + cur, 32u - cur); dst += 32u - cur; }
+        p = base + 32;
+    next_u32:;
+    }
+#endif
+    while (p < end) {
+        char c = *p++;
+        if (__builtin_expect(c != '\\', 1)) { *dst++ = c; continue; }
+        if (p >= end) break;
+        char e = *p++;
+        if (__builtin_expect(e == 'n', 1)) { *dst++ = '\n'; continue; }
+        switch (e) {
+            case '"':  *dst++ = '"';  break;
+            case '\\': *dst++ = '\\'; break;
+            case '/':  *dst++ = '/';  break;
+            case 't':  *dst++ = '\t'; break;
+            case 'b':  *dst++ = '\b'; break;
+            case 'f':  *dst++ = '\f'; break;
+            case 'r':
+                if (norm_cr) {
+                    *dst++ = '\n';
+                    if (p + 1 < end && p[0] == '\\' && p[1] == 'n') p += 2;
+                } else {
+                    *dst++ = '\r';
+                }
+                break;
+            case 'u':
+                if (p + 4 <= end) {
+                    uint32_t cp = parse_u4(p);
+                    p += 4;
+                    if (cp >= 0xD800 && cp <= 0xDBFF && p + 6 <= end && p[0] == '\\' && p[1] == 'u') {
+                        uint32_t lo = parse_u4(p + 2);
+                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000u + (((cp - 0xD800u) << 10) | (lo - 0xDC00u));
+                            p += 6;
+                        }
+                    }
+                    if (cp == '\r' && norm_cr) {
+                        *dst++ = '\n';
+                        if (p + 1 < end && p[0] == '\\' && p[1] == 'n') p += 2;
+                    } else {
+                        dst += utf8_encode(cp, dst);
+                    }
+                }
+                break;
+            default: *dst++ = e; break;
+        }
+    }
+done_u:;
+    uint32_t len = (uint32_t)(dst - dst_start);
+    __builtin_memset(dst, 0, 32); // 32B zero pad for safe SIMD over-reads!
+    return len;
+}
+
+static inline Str arena_dup_str(Arena *a, Str s) {
+    if (s.n == 0) return s;
+    char *p = arena_alloc(a, s.n);
+    fast_memcpy(p, s.p, s.n);
+    return (Str){ p, s.n };
+}
+
+// Unescape ONLY the frontmatter prefix (up to closing "---") from raw JSON string!
+// Returns 1 if closed frontmatter extracted into fm_dst (body_raw set to remainder in input JSON),
+// returns 0 if no opening "---" (reason=1), unclosed (reason=2), or too large (reason=3 -> fallback).
+static int extract_fm_from_raw(Str raw, char *fm_dst, uint32_t fm_cap, uint32_t *out_fm_len, Str *out_body_raw, int *out_reason) {
+    const char *p = raw.p;
+    const char *end = raw.p + raw.n;
+    char *dst = fm_dst;
+    char *dst_lim = fm_dst + fm_cap - 16;
+    uint32_t line_start = 0;
+    uint32_t line_no = 0;
+
+    while (p <= end) {
+        // Decode one character (or newline)
+        if (p == end) {
+            uint32_t cur_off = (uint32_t)(dst - fm_dst);
+            uint32_t llen = cur_off - line_start;
+            if (line_no == 0) {
+                if (llen != 3 || !fast_memeq(fm_dst, "---", 3)) { *out_reason = 1; return 0; }
+                *out_reason = 2; return 0; // "---" at EOF with no closing "---"
+            }
+            if (llen == 3 && fast_memeq(fm_dst + line_start, "---", 3)) {
+                *out_fm_len = cur_off;
+                *out_body_raw = (Str){ end, 0 };
+                return 1;
+            }
+            *out_reason = 2;
+            return 0;
+        }
+        if (__builtin_expect(dst >= dst_lim, 0)) { *out_reason = 3; return 0; }
+        char c = *p++;
+        int is_nl = 0;
+        if (__builtin_expect(c != '\\', 1)) {
+            *dst++ = c;
+            continue;
+        }
+        if (p >= end) { *out_reason = 2; return 0; }
+        char e = *p++;
+        if (__builtin_expect(e == 'n', 1)) {
+            is_nl = 1;
+        } else if (e == 'r') {
+            is_nl = 1;
+            if (p + 1 < end && p[0] == '\\' && p[1] == 'n') p += 2;
+        } else if (e == '"' || e == '\\' || e == '/') {
+            *dst++ = e;
+            continue;
+        } else if (e == 't') {
+            *dst++ = '\t';
+            continue;
+        } else if (e == 'b') {
+            *dst++ = '\b';
+            continue;
+        } else if (e == 'f') {
+            *dst++ = '\f';
+            continue;
+        } else if (e == 'u' && p + 4 <= end) {
+            uint32_t cp = parse_u4(p);
+            p += 4;
+            if (cp >= 0xD800 && cp <= 0xDBFF && p + 6 <= end && p[0] == '\\' && p[1] == 'u') {
+                uint32_t lo = parse_u4(p + 2);
+                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000u + (((cp - 0xD800u) << 10) | (lo - 0xDC00u));
+                    p += 6;
+                }
+            }
+            if (cp == '\n') {
+                is_nl = 1;
+            } else if (cp == '\r') {
+                is_nl = 1;
+                if (p + 1 < end && p[0] == '\\' && p[1] == 'n') p += 2;
+            } else {
+                dst += utf8_encode(cp, dst);
+                continue;
+            }
+        } else {
+            *dst++ = e;
+            continue;
+        }
+
+        if (is_nl) {
+            uint32_t cur_off = (uint32_t)(dst - fm_dst);
+            uint32_t llen = cur_off - line_start;
+            if (line_no == 0) {
+                if (llen != 3 || !fast_memeq(fm_dst, "---", 3)) { *out_reason = 1; return 0; }
+            } else if (llen == 3 && fast_memeq(fm_dst + line_start, "---", 3)) {
+                *out_fm_len = cur_off;
+                *out_body_raw = (Str){ p, (uint32_t)(end - p) };
+                return 1;
+            }
+            *dst++ = '\n';
+            line_start = (uint32_t)(dst - fm_dst);
+            line_no++;
+        }
+    }
+    *out_reason = 2;
+    return 0;
+}
+
+static __attribute__((cold, noinline)) void skip_json_val(const char **pp, const char *end);
+
 static uint32_t parse_json_uint(const char **pp, const char *end) {
     const char *p = *pp;
     uint32_t v = 0;
@@ -474,7 +823,7 @@ typedef struct {
     Str err;
 } FmResult;
 
-static Str make_refused_str(Arena *a, Str path, const char *msg1, Str mid, const char *msg2) {
+static __attribute__((cold, noinline)) Str make_refused_str(Arena *a, Str path, const char *msg1, Str mid, const char *msg2) {
     char tmp[1024];
     Buf b = { tmp, 0, sizeof(tmp) };
     BUF_LIT(&b, "refused ");
@@ -831,40 +1180,7 @@ static inline int resolve_rel_path_pre(const Str *dir_parts, uint32_t dir_nparts
     return 1;
 }
 
-static Str resolve_link_cb(void *vctx, Str target) {
-    LinkCtx *ctx = (LinkCtx *)vctx;
-    if (target.n > 0 && (target.p[0] == '/' || target.p[0] == '#' || is_scheme(target))) return target;
-    uint32_t hash_pos = target.n;
-    for (uint32_t i = 0; i < target.n; i++) {
-        if (target.p[i] == '#') { hash_pos = i; break; }
-    }
-    Str rel = { target.p, hash_pos };
-    Str frag = { target.p + hash_pos, target.n - hash_pos };
-    if (rel.n > 0) {
-        char rbuf[1024];
-        uint32_t rlen = 0;
-        if (resolve_rel_path_pre(ctx->dir_parts, ctx->dir_nparts, rel, rbuf, &rlen)) {
-            Str rstr = { rbuf, rlen };
-            uint32_t h = fnv1a_hash(rbuf, rlen);
-            uint32_t sidx;
-            if (sm_get(ctx->by_source, rstr, h, &sidx)) {
-                Str url = ctx->sources[sidx].url;
-                if (frag.n == 0) return url;
-                fast_memcpy(ctx->tmp_href, url.p, url.n);
-                fast_memcpy(ctx->tmp_href + url.n, frag.p, frag.n);
-                return (Str){ ctx->tmp_href, url.n + frag.n };
-            }
-            if (sm_get(ctx->static_paths, rstr, h, NULL)) {
-                uint32_t pos = 0;
-                fast_memcpy(ctx->tmp_href, ctx->base.p, ctx->base.n); pos += ctx->base.n;
-                ctx->tmp_href[pos++] = '/';
-                fast_memcpy(ctx->tmp_href + pos, rbuf, rlen); pos += rlen;
-                if (frag.n) { fast_memcpy(ctx->tmp_href + pos, frag.p, frag.n); pos += frag.n; }
-                return (Str){ ctx->tmp_href, pos };
-            }
-        }
-    }
-    // Record broken link (deduplicated via broken_set)
+static __attribute__((cold, noinline)) void record_broken_link(LinkCtx *ctx, Str target) {
     uint32_t blen = 12 + ctx->cur_path.n + 4 + target.n;
     char btmp[2048];
     fast_memcpy(btmp, "broken-link ", 12);
@@ -879,6 +1195,63 @@ static Str resolve_link_cb(void *vctx, Str target) {
         sm_put_new(ctx->broken_set, bs, bh, 1);
         ctx->broken_list[(*ctx->broken_len)++] = bs;
     }
+}
+
+static Str resolve_link_cb(void *vctx, Str target, int *out_preescaped) {
+    LinkCtx *ctx = (LinkCtx *)vctx;
+    *out_preescaped = 0;
+    if (target.n > 0 && (target.p[0] == '/' || target.p[0] == '#' || is_scheme(target))) return target;
+    uint32_t hash_pos = target.n;
+    int simple_rel = (target.n > 0 && target.p[0] != '.');
+    for (uint32_t i = 0; i < target.n; i++) {
+        char ch = target.p[i];
+        if (ch == '#') { hash_pos = i; break; }
+        if (ch == '/' && (i + 1 >= target.n || target.p[i + 1] == '.' || target.p[i + 1] == '/')) simple_rel = 0;
+    }
+    Str rel = { target.p, hash_pos };
+    Str frag = { target.p + hash_pos, target.n - hash_pos };
+    if (rel.n > 0) {
+        char rbuf[1024];
+        uint32_t rlen = 0;
+        int ok = 1;
+        if (__builtin_expect(simple_rel && ctx->cur_dir.n + 1 + rel.n < sizeof(rbuf), 1)) {
+            if (ctx->cur_dir.n > 0) {
+                fast_memcpy(rbuf, ctx->cur_dir.p, ctx->cur_dir.n);
+                rbuf[ctx->cur_dir.n] = '/';
+                fast_memcpy(rbuf + ctx->cur_dir.n + 1, rel.p, rel.n);
+                rlen = ctx->cur_dir.n + 1 + rel.n;
+            } else {
+                fast_memcpy(rbuf, rel.p, rel.n);
+                rlen = rel.n;
+            }
+        } else {
+            ok = resolve_rel_path_pre(ctx->dir_parts, ctx->dir_nparts, rel, rbuf, &rlen);
+        }
+        if (ok) {
+            Str rstr = { rbuf, rlen };
+            uint32_t h = fnv1a_hash(rbuf, rlen);
+            uint32_t sidx;
+            if (sm_get(ctx->by_source, rstr, h, &sidx)) {
+                if (__builtin_expect(frag.n == 0, 1)) {
+                    *out_preescaped = 1;
+                    return ctx->sources[sidx].url_hj;
+                }
+                Str url = ctx->sources[sidx].url;
+                fast_memcpy(ctx->tmp_href, url.p, url.n);
+                fast_memcpy(ctx->tmp_href + url.n, frag.p, frag.n);
+                return (Str){ ctx->tmp_href, url.n + frag.n };
+            }
+            if (sm_get(ctx->static_paths, rstr, h, NULL)) {
+                uint32_t pos = 0;
+                fast_memcpy(ctx->tmp_href, ctx->base.p, ctx->base.n); pos += ctx->base.n;
+                ctx->tmp_href[pos++] = '/';
+                fast_memcpy(ctx->tmp_href + pos, rbuf, rlen); pos += rlen;
+                if (frag.n) { fast_memcpy(ctx->tmp_href + pos, frag.p, frag.n); pos += frag.n; }
+                return (Str){ ctx->tmp_href, pos };
+            }
+        }
+    }
+    record_broken_link(ctx, target);
     return target;
 }
 
@@ -952,8 +1325,8 @@ static void process_case(const char **pp, const char *end) {
                         skip_ws(pp, end);
                         if (**pp == ']') { (*pp)++; break; }
                         if (**pp == '{') (*pp)++;
-                        Str fp = { "", 0 }, fc = { "", 0 };
-                        int has_path = 0, is_md = 0, has_cr = 0;
+                        Str fp = { "", 0 }, fraw = { "", 0 };
+                        uint8_t rflags = 0;
                         while (*pp < end) {
                             skip_ws(pp, end);
                             if (**pp == '}') { (*pp)++; break; }
@@ -962,11 +1335,9 @@ static void process_case(const char **pp, const char *end) {
                             skip_ws(pp, end);
                             if (fk.n == 4 && fast_memeq(fk.p, "path", 4)) {
                                 fp = parse_json_str(pp, end, &arena, 0, NULL);
-                                has_path = 1;
-                                is_md = (fp.n >= 3 && fp.p[fp.n - 3] == '.' && fp.p[fp.n - 2] == 'm' && fp.p[fp.n - 1] == 'd');
                             } else if (fk.n == 7 && fast_memeq(fk.p, "content", 7)) {
-                                // Fused CR normalization when path already known to be .md!
-                                fc = parse_json_str(pp, end, &arena, has_path && is_md, &has_cr);
+                                // Zero-write AVX2 scan! Leaves .md & static payloads in input buffer!
+                                fraw = skip_json_str_raw(pp, end, &rflags);
                             } else {
                                 skip_json_val(pp, end);
                             }
@@ -975,8 +1346,8 @@ static void process_case(const char **pp, const char *end) {
                         }
                         if (in_file_count < 4096u) {
                             in_files[in_file_count].path = fp;
-                            in_files[in_file_count].content = fc;
-                            in_files[in_file_count].has_cr = has_cr;
+                            in_files[in_file_count].raw_json = fraw;
+                            in_files[in_file_count].raw_flags = rflags;
                             in_file_count++;
                         }
                         skip_ws(pp, end);
@@ -1041,6 +1412,7 @@ static void process_case(const char **pp, const char *end) {
     Str **src_raw_tags = (Str **)arena_alloc_aligned(&arena, (in_file_count + 1u) * (uint32_t)sizeof(Str *), 8);
     uint32_t *src_raw_tag_cnt = (uint32_t *)arena_alloc_aligned(&arena, (in_file_count + 1u) * 4u, 4);
 
+    char fm_stack[8192];
     for (uint32_t i = 0; i < in_file_count; i++) {
         InputFile *f = &in_files[i];
         int is_md = (f->path.n >= 3 && f->path.p[f->path.n - 3] == '.' && f->path.p[f->path.n - 2] == 'm' && f->path.p[f->path.n - 1] == 'd');
@@ -1049,24 +1421,30 @@ static void process_case(const char **pp, const char *end) {
             sm_put_new(&static_paths, f->path, fnv1a_hash(f->path.p, f->path.n), static_count - 1u);
             continue;
         }
-        // Normalize CR if content appeared before path in JSON and contained '\r'
-        Str text = f->content;
-        if (f->has_cr) {
-            char *nb = arena_alloc(&arena, text.n);
-            uint32_t out_n = 0;
-            for (uint32_t j = 0; j < text.n; j++) {
-                if (text.p[j] == '\r') {
-                    nb[out_n++] = '\n';
-                    if (j + 1 < text.n && text.p[j + 1] == '\n') j++;
-                } else {
-                    nb[out_n++] = text.p[j];
-                }
-            }
-            arena.pos = (uint32_t)(nb - arena.base) + out_n;
-            text = (Str){ nb, out_n };
+        // Lazy front-matter-only unescape! Drafts & refused files NEVER unescape their body!
+        uint32_t fm_len = 0;
+        Str body_raw = { "", 0 };
+        int fm_reason = 0;
+        Str fm_text = { "", 0 };
+        int used_stack = 0;
+        if (extract_fm_from_raw(f->raw_json, fm_stack, sizeof(fm_stack), &fm_len, &body_raw, &fm_reason)) {
+            fm_text = (Str){ fm_stack, fm_len };
+            used_stack = 1;
+        } else if (fm_reason == 1) {
+            report[report_len++] = make_refused_str(&arena, f->path, "no front matter", (Str){0, 0}, NULL);
+            continue;
+        } else if (fm_reason == 2) {
+            report[report_len++] = make_refused_str(&arena, f->path, "the front matter is not closed", (Str){0, 0}, NULL);
+            continue;
+        } else {
+            // Huge frontmatter (> 8 KB) fallback: unescape full string into arena
+            char *full_dst = arena_alloc(&arena, f->raw_json.n + 64u);
+            uint32_t full_n = unescape_raw_into(f->raw_json, full_dst, 1);
+            arena.pos = (uint32_t)(full_dst - arena.base) + full_n;
+            fm_text = (Str){ full_dst, full_n };
         }
         FmResult fm;
-        if (!parse_front_matter(f->path, text, &arena, &fm)) {
+        if (!parse_front_matter(f->path, fm_text, &arena, &fm)) {
             report[report_len++] = fm.err;
             continue;
         }
@@ -1097,6 +1475,21 @@ static void process_case(const char **pp, const char *end) {
             report[report_len++] = (Str){ d, 6 + f->path.n };
             continue;
         }
+        // Persist tiny metadata slices out of stack `fm_stack` into arena!
+        #define PERSIST_FM(str) do { \
+            if (used_stack && (str).p >= fm_stack && (str).p < fm_stack + sizeof(fm_stack)) \
+                (str) = arena_dup_str(&arena, (str)); \
+        } while (0)
+        PERSIST_FM(fm.title);
+        if (fm.has_date) PERSIST_FM(fm.date);
+        if (fm.has_summary) PERSIST_FM(fm.summary);
+        if (fm.has_slug) PERSIST_FM(fm.slug);
+        if (fm.has_layout) PERSIST_FM(layout);
+        if (used_stack) {
+            for (uint32_t tj = 0; tj < fm.tags_len; tj++) PERSIST_FM(fm.tags[tj]);
+        }
+        #undef PERSIST_FM
+
         PostData *s = &sources[src_count];
         __builtin_memset(s, 0, sizeof(*s));
         s->path = f->path;
@@ -1107,7 +1500,9 @@ static void process_case(const char **pp, const char *end) {
         s->summary = fm.has_summary ? fm.summary : (Str){ "", 0 };
         s->summary_hj = fm.has_summary ? html_json_escape_arena(fm.summary, &arena) : (Str){ "", 0 };
         s->slug = fm.has_slug ? fm.slug : (Str){ "", 0 }; // empty means compute via slugify(title)
-        s->body = fm.body;
+        s->body_raw = used_stack ? body_raw : fm.body;
+        s->body_raw_has_cr = used_stack ? 1u : 0u; // 1 = still raw JSON; 0 = already unescaped
+        s->body_raw_flags = f->raw_flags;
         s->layout = layout;
         s->is_post = is_post;
         s->newer_idx = -1;
@@ -1332,16 +1727,47 @@ static void process_case(const char **pp, const char *end) {
     lctx.broken_len = &broken_len;
     lctx.arena = &arena;
 
+    // Helper: decode page body into L1-hot g_body_scratch (or mmap if > 65500B) with 32B zero pad!
+    #define LOAD_BODY(post_ptr, out_str, out_mmap_ptr, out_mmap_cap) do { \
+        (out_mmap_ptr) = NULL; (out_mmap_cap) = 0; \
+        if ((post_ptr)->body_raw_has_cr) { \
+            char *_bdst = g_body_scratch; \
+            if (__builtin_expect((post_ptr)->body_raw.n > 65500u, 0)) { \
+                (out_mmap_cap) = (post_ptr)->body_raw.n + 64u; \
+                _bdst = (char *)sys_mmap(NULL, (out_mmap_cap), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); \
+                (out_mmap_ptr) = _bdst; \
+            } \
+            uint32_t _blen = unescape_raw_into((post_ptr)->body_raw, _bdst, 1); \
+            (out_str) = (Str){ _bdst, _blen }; \
+        } else { \
+            (out_str) = (post_ptr)->body_raw; \
+        } \
+    } while (0)
+
     // Pre-render ONLY the top `recent_len` posts (typically 3-6 posts) so `recent` cards are 100% ready before site-baking!
     uint32_t recent_len = (posts_len < site_recent) ? posts_len : site_recent;
     for (uint32_t k = 0; k < recent_len; k++) {
         PostData *p = posts[k];
-        uint32_t w = words_of(p->body.p, p->body.n);
-        p->reading_minutes = (w == 0) ? 1u : (w + 199u) / 200u;
-        p->words_computed = 1;
         link_ctx_set_source(&lctx, p->path);
         id_arena.pos = 0;
-        MdResult md = render_markdown_json(p->body, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, 1024);
+        MdResult md;
+#if defined(__AVX2__)
+        if (__builtin_expect(p->body_raw_has_cr && !(p->body_raw_flags & (RAW_HAS_CR | RAW_HAS_NEEDS_REESC)), 1)) {
+            uint32_t w = words_of_raw(p->body_raw.p, p->body_raw.n);
+            p->reading_minutes = (w == 0) ? 1u : (w + 199u) / 200u;
+            p->words_computed = 1;
+            md = render_markdown_raw_json(p->body_raw, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, 1024);
+        } else
+#endif
+        {
+            Str body; char *bmmap; uint32_t bcap;
+            LOAD_BODY(p, body, bmmap, bcap);
+            uint32_t w = words_of(body.p, body.n);
+            p->reading_minutes = (w == 0) ? 1u : (w + 199u) / 200u;
+            p->words_computed = 1;
+            md = render_markdown_json(body, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, 1024);
+            if (bmmap) sys_munmap(bmmap, bcap);
+        }
         // Save html + toc + excerpt into arena so we don't re-render these 3-6 posts later!
         char *hcopy = arena_alloc(&arena, md.html.n);
         fast_memcpy(hcopy, md.html.p, md.html.n);
@@ -1410,17 +1836,32 @@ static void process_case(const char **pp, const char *end) {
         Template *lt = &templates[tidx];
         if (!lt->baked_ready[1]) compile_layout(&rc, lt, 1, &arena);
 
-        if (!s->words_computed && (s->is_post || lt->uses_readmin[1])) {
-            uint32_t w = words_of(s->body.p, s->body.n);
-            s->reading_minutes = (w == 0) ? 1u : (w + 199u) / 200u;
-            s->words_computed = 1;
-        }
         MdResult md;
         const MdResult *md_ptr = NULL;
         if (!s->md_prerendered) {
             link_ctx_set_source(&lctx, s->path);
             id_arena.pos = 0;
-            md = render_markdown_json(s->body, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, 1024);
+#if defined(__AVX2__)
+            if (__builtin_expect(s->body_raw_has_cr && !(s->body_raw_flags & (RAW_HAS_CR | RAW_HAS_NEEDS_REESC)), 1)) {
+                if (!s->words_computed && (s->is_post || lt->uses_readmin[1])) {
+                    uint32_t w = words_of_raw(s->body_raw.p, s->body_raw.n);
+                    s->reading_minutes = (w == 0) ? 1u : (w + 199u) / 200u;
+                    s->words_computed = 1;
+                }
+                md = render_markdown_raw_json(s->body_raw, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, 1024);
+            } else
+#endif
+            {
+                Str body; char *bmmap; uint32_t bcap;
+                LOAD_BODY(s, body, bmmap, bcap);
+                if (!s->words_computed && (s->is_post || lt->uses_readmin[1])) {
+                    uint32_t w = words_of(body.p, body.n);
+                    s->reading_minutes = (w == 0) ? 1u : (w + 199u) / 200u;
+                    s->words_computed = 1;
+                }
+                md = render_markdown_json(body, resolve_link_cb, &lctx, &md_buf, &join_buf, &g_hset, &id_arena, g_toc_scratch, 1024);
+                if (bmmap) sys_munmap(bmmap, bcap);
+            }
             md_ptr = &md;
             // Save tiny excerpt for posts (needed for index/tag cards!)
             if (s->is_post && !s->has_excerpt_cached) {
@@ -1549,7 +1990,8 @@ static void process_case(const char **pp, const char *end) {
         out_char('"');
     }
 
-    // E. Stream non-shadowed static files
+    // E. Stream non-shadowed static files (ZERO-COPY raw JSON passthrough when clean!)
+    #undef LOAD_BODY
     for (uint32_t i = 0; i < static_count; i++) {
         InputFile *f = &statics[i];
         if (sm_get(&out_paths, f->path, fnv1a_hash(f->path.p, f->path.n), NULL)) {
@@ -1565,7 +2007,19 @@ static void process_case(const char **pp, const char *end) {
             out_char('"');
             out_json_escaped(f->path.p, f->path.n);
             OUT_LIT("\":\"");
-            out_json_escaped(f->content.p, f->content.n);
+            if (__builtin_expect(!(f->raw_flags & RAW_HAS_NEEDS_REESC), 1)) {
+                out_raw(f->raw_json.p, f->raw_json.n);
+            } else {
+                char *sdst = g_body_scratch;
+                uint32_t scap = 0;
+                if (f->raw_json.n > 65500u) {
+                    scap = f->raw_json.n + 64u;
+                    sdst = (char *)sys_mmap(NULL, scap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                }
+                uint32_t slen = unescape_raw_into(f->raw_json, sdst, 0);
+                out_json_escaped(sdst, slen);
+                if (scap) sys_munmap(sdst, scap);
+            }
             out_char('"');
         }
     }
